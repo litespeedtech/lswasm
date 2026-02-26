@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/bob/proj/lswasm/build",
+  "command": "/usr/bin/g++ -g -std=gnu++17 -o CMakeFiles/wasm-proxy.dir/src/main.cpp.o -c /home/bob/proj/lswasm/src/main.cpp",
+  "file": "/home/bob/proj/lswasm/src/main.cpp",
+  "output": "CMakeFiles/wasm-proxy.dir/src/main.cpp.o"
+}
+]
