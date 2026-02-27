@@ -1,12 +1,15 @@
 # WASM HTTP Proxy Server
 
-A C++ HTTP proxy server that can execute WebAssembly (WASM) modules using proxy-wasm-cpp-host, with support for both **Wasmer** and **Wasmtime** runtimes.
+A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for both **Wasmer** and **Wasmtime** runtimes.
 
 ## Features
 
-- HTTP proxy server listening on configurable port (default: 8080)
-- WASM module execution via proxy-wasm-cpp-host
+- Single-threaded, `epoll`-based HTTP server (Linux)
+- TCP and **Unix domain socket** listeners
+- WASM filter module loading and execution via proxy-wasm-cpp-host
+- HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
 - Support for both Wasmer and Wasmtime runtimes
+- Per-module environment variables (`--env KEY=VALUE`)
 - Graceful shutdown with signal handling (SIGINT, SIGTERM)
 - Modular CMake-based build system
 
@@ -14,10 +17,19 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) modules using proxy-
 
 ```
 ├── src/
-│   └── main.cpp              # HTTP server and proxy handler
+│   ├── main.cpp                # HTTP server (epoll loop, CLI, request handling)
+│   ├── http_filter.h           # HTTP filter context (filter chain lifecycle)
+│   ├── wasm_module_manager.h   # WASM module manager (load, execute, state)
+│   ├── wasm_module_manager.cc  # WASM module manager implementation
+│   └── hash_shim.cc            # Hash helper shim
+├── samples/
+│   ├── sample_filter.c         # Example WASM filter (C source)
+│   ├── sample_filter.wasm      # Pre-compiled sample filter
+│   ├── CMakeLists.txt          # Build rules for samples
+│   └── README.md               # Sample documentation
 ├── third_party/
-│   └── proxy-wasm-cpp-host/  # Git submodule
-└── CMakeLists.txt            # Build configuration
+│   └── proxy-wasm-cpp-host/    # Git submodule
+└── CMakeLists.txt              # Build configuration
 ```
 
 ### Submodule Integration
@@ -153,6 +165,26 @@ Server will listen on `http://localhost:8080`
 ./lswasm --port 9000
 ```
 
+### Unix Domain Socket
+
+```bash
+./lswasm --uds /tmp/lswasm.sock
+```
+
+When both `--port` and `--uds` are given, only `--uds` is used.
+
+### Loading a WASM Filter Module
+
+```bash
+./lswasm --module samples/sample_filter.wasm
+```
+
+### Passing Environment Variables to WASM Modules
+
+```bash
+./lswasm --module samples/sample_filter.wasm --env MY_KEY=my_value --env ANOTHER=val
+```
+
 ### Help
 
 ```bash
@@ -206,13 +238,23 @@ lswasm/
 ├── .gitignore                          # Git ignore rules
 ├── .gitmodules                         # Git submodule configuration
 ├── src/
-│   └── main.cpp                        # HTTP server implementation
+│   ├── main.cpp                        # HTTP server (epoll loop, CLI)
+│   ├── http_filter.h                   # HTTP filter context & chain
+│   ├── wasm_module_manager.h           # WASM module manager header
+│   ├── wasm_module_manager.cc          # WASM module manager impl
+│   └── hash_shim.cc                    # Hash helper shim
+├── samples/
+│   ├── sample_filter.c                 # Example WASM filter source
+│   ├── sample_filter.wasm              # Pre-compiled sample filter
+│   ├── sample_filter.explore.html      # Interactive filter explorer
+│   ├── CMakeLists.txt                  # Sample build rules
+│   └── README.md                       # Sample documentation
 ├── third_party/
 │   └── proxy-wasm-cpp-host/           # WASM host library (submodule)
 │       ├── include/proxy-wasm/        # Header files
 │       ├── src/                       # Implementation files
 │       └── ...
-└── build/                              # Build output directory
+└── build/                              # Build output directory (gitignored)
     ├── lswasm                          # Compiled executable
     └── compile_commands.json           # For IDE support
 ```
@@ -271,10 +313,10 @@ Failed to bind socket to port 8080
 
 ## TODO: Future Enhancements
 
-- [ ] Load and execute actual WASM modules from files
+- [x] Load and execute actual WASM modules from files
+- [x] WASM module lifecycle management (load, unload, reload)
 - [ ] HTTP path routing to different WASM modules
 - [ ] Response header manipulation from WASM modules
-- [ ] WASM module lifecycle management (load, unload, reload)
 - [ ] Support for additional WASM runtimes (WasmEdge, WAMR)
 - [ ] TLS/HTTPS support
 - [ ] Configuration file support (YAML/JSON)

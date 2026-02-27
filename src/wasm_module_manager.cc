@@ -135,9 +135,6 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
           return false;
         }
 
-        // Allocate a new context ID from the wasm base.
-        uint32_t new_ctx_id = wasm->allocContextId();
-
         // Create a stream context via proxy_on_context_create.
         auto *ctx = wasm->createContext(state.plugin);
         if (!ctx) {

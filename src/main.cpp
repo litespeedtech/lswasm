@@ -4,7 +4,6 @@
 #include <vector>
 #include <map>
 #include <unordered_map>
-#include <thread>
 #include <atomic>
 #include <stdexcept>
 #include <sstream>
@@ -13,9 +12,12 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <csignal>
+#include <cerrno>
 
 #include "http_filter.h"
 #include "wasm_module_manager.h"
@@ -24,7 +26,8 @@
 const int DEFAULT_PORT = 8080;
 const int BACKLOG = 5;
 const int BUFFER_SIZE = 4096;
-const int MAX_THREADS = 10;
+const int MAX_EPOLL_EVENTS = 64;
+const size_t MAX_REQUEST_SIZE = 65536;  // 64 KB limit per request
 
 // Global state
 static volatile sig_atomic_t g_shutdown = 0;
@@ -70,28 +73,141 @@ public:
     }
 
     void accept_connections() {
-        while (g_shutdown == 0) {
-            sockaddr_storage client_addr{};
-            socklen_t client_addrlen = sizeof(client_addr);
+        int epoll_fd = epoll_create1(0);
+        if (epoll_fd < 0) {
+            std::cerr << "Failed to create epoll fd: " << strerror(errno) << std::endl;
+            return;
+        }
 
-            int client_socket = accept(server_socket_,
-                                       reinterpret_cast<sockaddr *>(&client_addr),
-                                       &client_addrlen);
-            if (client_socket < 0) {
+        // Make the server socket non-blocking so accept() won't block.
+        set_nonblocking(server_socket_);
+
+        // Register the server (listening) socket with epoll.
+        struct epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = server_socket_;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket_, &ev) < 0) {
+            std::cerr << "Failed to add server socket to epoll: " << strerror(errno) << std::endl;
+            close(epoll_fd);
+            return;
+        }
+
+        // Per-connection read buffers keyed by client fd.
+        std::unordered_map<int, std::string> client_buffers;
+
+        struct epoll_event events[MAX_EPOLL_EVENTS];
+
+        while (g_shutdown == 0) {
+            int nfds = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, 200 /*ms*/);
+            if (nfds < 0) {
+                if (errno == EINTR) continue;  // Interrupted by signal
                 if (g_shutdown != 0) break;
-                std::cerr << "Accept error" << std::endl;
-                continue;
+                std::cerr << "epoll_wait error: " << strerror(errno) << std::endl;
+                break;
             }
 
-            // Handle client in a thread
-            std::thread(&HttpServer::handle_client, this, client_socket).detach();
+            for (int i = 0; i < nfds; ++i) {
+                int fd = events[i].data.fd;
+
+                if (fd == server_socket_) {
+                    // Accept all pending connections.
+                    while (true) {
+                        sockaddr_storage client_addr{};
+                        socklen_t client_addrlen = sizeof(client_addr);
+                        int client_socket = accept(server_socket_,
+                                                   reinterpret_cast<sockaddr *>(&client_addr),
+                                                   &client_addrlen);
+                        if (client_socket < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                break;  // No more pending connections.
+                            }
+                            if (g_shutdown != 0) break;
+                            std::cerr << "Accept error: " << strerror(errno) << std::endl;
+                            break;
+                        }
+
+                        set_nonblocking(client_socket);
+
+                        struct epoll_event client_ev{};
+                        client_ev.events = EPOLLIN;
+                        client_ev.data.fd = client_socket;
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &client_ev) < 0) {
+                            std::cerr << "Failed to add client socket to epoll: "
+                                      << strerror(errno) << std::endl;
+                            close(client_socket);
+                            continue;
+                        }
+
+                        client_buffers[client_socket] = std::string();
+                    }
+                } else {
+                    // Client socket is readable — accumulate data.
+                    char buf[BUFFER_SIZE];
+                    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+
+                    if (n < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            continue;  // No data right now, wait for next epoll event.
+                        }
+                        // Real error — clean up.
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                        close(fd);
+                        client_buffers.erase(fd);
+                        continue;
+                    }
+                    if (n == 0) {
+                        // Peer closed connection.
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                        close(fd);
+                        client_buffers.erase(fd);
+                        continue;
+                    }
+
+                    client_buffers[fd].append(buf, static_cast<size_t>(n));
+
+                    // Guard against unbounded buffer growth (e.g. slow / malicious clients).
+                    if (client_buffers[fd].size() > MAX_REQUEST_SIZE) {
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                        close(fd);
+                        client_buffers.erase(fd);
+                        continue;
+                    }
+
+                    // Check whether we have received the full HTTP headers.
+                    if (client_buffers[fd].find("\r\n\r\n") != std::string::npos) {
+                        // Full request headers received — process synchronously.
+                        handle_client_data(fd, client_buffers[fd]);
+
+                        // Done with this connection.
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                        close(fd);
+                        client_buffers.erase(fd);
+                    }
+                }
+            }
         }
+
+        // Clean up remaining client connections.
+        for (auto &[fd, _buf] : client_buffers) {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+        }
+        client_buffers.clear();
+        close(epoll_fd);
     }
 
 private:
     enum class Mode { TCP, UDS };
 
     HttpServer() : mode_(Mode::TCP), port_(DEFAULT_PORT), server_socket_(-1) {}
+
+    // ── Helper: set a socket to non-blocking mode ───────────────────────
+
+    static void set_nonblocking(int fd) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0) flags = 0;
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 
     // ── TCP listener ────────────────────────────────────────────────────
 
@@ -193,27 +309,38 @@ private:
         }
     }
 
-    // ── Request handling (shared by both modes) ─────────────────────────
+    // ── Helpers ─────────────────────────────────────────────────────────
 
-    void handle_client(int client_socket) {
-        char buffer[BUFFER_SIZE];
-        std::memset(buffer, 0, sizeof(buffer));
+    // Write all bytes to a non-blocking socket, retrying on partial writes.
+    static void send_all(int fd, const std::string &data) {
+        // Switch to blocking mode for the synchronous send so we don't
+        // have to manage EAGAIN / partial-write retries ourselves.
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 
-        // Read HTTP request
-        ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-        if (bytes_read <= 0) {
-            close(client_socket);
-            return;
+        size_t total_sent = 0;
+        while (total_sent < data.size()) {
+            ssize_t n = ::send(fd, data.c_str() + total_sent,
+                               data.size() - total_sent, 0);
+            if (n < 0) {
+                std::cerr << "send error: " << strerror(errno) << std::endl;
+                break;
+            }
+            total_sent += static_cast<size_t>(n);
         }
 
-        buffer[bytes_read] = '\0';
+        // Restore non-blocking mode (fd will be closed shortly, but be tidy).
+        fcntl(fd, F_SETFL, flags);
+    }
 
-        // Parse HTTP request
-        std::string request(buffer);
+    // ── Request handling (shared by both modes) ─────────────────────────
+
+    // Process a fully-accumulated HTTP request for the given client fd.
+    // The caller (epoll loop) is responsible for closing the fd afterwards.
+    void handle_client_data(int client_socket, const std::string &request) {
         HttpData http_data;
-        
+
         if (!parse_request(request, http_data)) {
-            close(client_socket);
             return;
         }
 
@@ -230,8 +357,7 @@ private:
         if (http_data.has_local_response) {
             std::cout << "[HTTP] WASM filter sent local response, using it." << std::endl;
             auto response = build_local_response(http_data);
-            send(client_socket, response.c_str(), response.length(), 0);
-            close(client_socket);
+            send_all(client_socket, response);
             return;
         }
 
@@ -250,8 +376,7 @@ private:
         filter_ctx.onDone();
 
         // Send HTTP response
-        send(client_socket, response.c_str(), response.length(), 0);
-        close(client_socket);
+        send_all(client_socket, response);
     }
 
     bool parse_request(const std::string& request, HttpData &http_data) {

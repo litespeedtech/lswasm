@@ -1,0 +1,24 @@
+# Build directory
+build/
+cmake-build-debug/
+cmake-build-release/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Binaries
+lswasm
+*.a
+*.o
+*.so
+
+# CMake
+CMakeLists.txt.user
+CMakeUserPresets.json
+
+# macOS
+.DS_Store

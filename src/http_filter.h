@@ -51,6 +51,12 @@ public:
 
   // HTTP stream lifecycle hooks (filter callback points)
   
+  // NOTE on has_local_response checks:
+  //   onRequestHeaders is the only phase that can *set* has_local_response
+  //   (via checkLocalResponse after executeFilter).  All other phases check
+  //   the flag *before* calling executeFilter so they short-circuit the
+  //   entire chain immediately if a prior phase already produced a local
+  //   response.
   void onRequestHeaders() {
     std::cout << "[Filter] onRequestHeaders called (context_id: " << context_id_ << ")" << std::endl;
     if (g_module_manager) {
@@ -58,6 +64,7 @@ public:
         g_module_manager->executeFilter(m, context_id_, "onRequestHeaders");
         // Check if the WASM module sent a local response.
         checkLocalResponse(m);
+        if (http_data_->has_local_response) break;  // Stop filter chain
       }
     }
   }
@@ -66,6 +73,7 @@ public:
     std::cout << "[Filter] onRequestBody called (context_id: " << context_id_ << ")" << std::endl;
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onRequestBody");
       }
     }
@@ -75,6 +83,7 @@ public:
     std::cout << "[Filter] onRequestTrailers called (context_id: " << context_id_ << ")" << std::endl;
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onRequestTrailers");
       }
     }
@@ -84,6 +93,7 @@ public:
     std::cout << "[Filter] onResponseHeaders called (context_id: " << context_id_ << ")" << std::endl;
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onResponseHeaders");
       }
     }
@@ -93,6 +103,7 @@ public:
     std::cout << "[Filter] onResponseBody called (context_id: " << context_id_ << ")" << std::endl;
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onResponseBody");
       }
     }
@@ -102,6 +113,7 @@ public:
     std::cout << "[Filter] onResponseTrailers called (context_id: " << context_id_ << ")" << std::endl;
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onResponseTrailers");
       }
     }
