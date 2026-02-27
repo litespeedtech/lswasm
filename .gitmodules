@@ -1,0 +1,9 @@
+[submodule "third_party/proxy-wasm-cpp-host"]
+	path = third_party/proxy-wasm-cpp-host
+	url = https://github.com/proxy-wasm/proxy-wasm-cpp-host.git
+[submodule "third_party/proxy-wasm-spec"]
+	path = third_party/proxy-wasm-spec
+	url = https://github.com/proxy-wasm/spec.git
+[submodule "third_party/proxy-wasm-cpp-sdk"]
+	path = third_party/proxy-wasm-cpp-sdk
+	url = https://github.com/proxy-wasm/proxy-wasm-cpp-sdk.git

@@ -1,3 +1,4 @@
-/home/bob/proj/lswasm/build/CMakeFiles/wasm-proxy.dir
+/home/bob/proj/lswasm/build/CMakeFiles/proxy-wasm-host.dir
+/home/bob/proj/lswasm/build/CMakeFiles/lswasm.dir
 /home/bob/proj/lswasm/build/CMakeFiles/edit_cache.dir
 /home/bob/proj/lswasm/build/CMakeFiles/rebuild_cache.dir
