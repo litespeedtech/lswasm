@@ -9,7 +9,7 @@ bool WasmModuleManager::loadModule(const std::string &module_path,
   // Read WASM file
   std::ifstream file(module_path, std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
-    std::cerr << "Failed to open WASM module: " << module_path << std::endl;
+    LOG_ERROR("Failed to open WASM module: " << module_path);
     return false;
   }
 
@@ -21,7 +21,7 @@ bool WasmModuleManager::loadModule(const std::string &module_path,
   file.close();
 
   if (!file) {
-    std::cerr << "Failed to read WASM module: " << module_path << std::endl;
+    LOG_ERROR("Failed to read WASM module: " << module_path);
     return false;
   }
 
@@ -31,19 +31,20 @@ bool WasmModuleManager::loadModule(const std::string &module_path,
 bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_size,
                                               const std::string &module_name) {
   if (modules_.find(module_name) != modules_.end()) {
-    std::cerr << "Module already loaded: " << module_name << std::endl;
+    LOG_ERROR("Module already loaded: " << module_name);
     return false;
   }
 
   try {
-    std::cout << "Loading WASM module: " << module_name << " (" << code_size << " bytes)"
-              << std::endl;
+    LOG_INFO("Loading WASM module: " << module_name << " (" << code_size << " bytes)");
 
-    // Create a Wasmtime VM instance.
-#ifdef ENABLE_WASMTIME
+    // Create a VM instance for the configured runtime.
+#if defined(WASM_RUNTIME_WASMTIME)
     auto vm = proxy_wasm::createWasmtimeVm();
+#elif defined(WASM_RUNTIME_V8)
+    auto vm = proxy_wasm::createV8Vm();
 #else
-    std::cerr << "No WASM runtime available (Wasmtime not enabled)" << std::endl;
+    LOG_ERROR("No WASM runtime available (build with -DWASM_RUNTIME=wasmtime or -DWASM_RUNTIME=v8)");
     return false;
 #endif
 
@@ -57,13 +58,13 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     // Load the WASM bytecode.
     std::string bytecode(reinterpret_cast<const char *>(code), code_size);
     if (!wasm->load(bytecode, /*allow_precompiled=*/false)) {
-      std::cerr << "Failed to load WASM bytecode for module: " << module_name << std::endl;
+      LOG_ERROR("Failed to load WASM bytecode for module: " << module_name);
       return false;
     }
 
     // Initialize the VM (registers ABI callbacks, links imports, runs _initialize).
     if (!wasm->initialize()) {
-      std::cerr << "Failed to initialize WASM module: " << module_name << std::endl;
+      LOG_ERROR("Failed to initialize WASM module: " << module_name);
       return false;
     }
 
@@ -80,13 +81,13 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     // Start the VM (calls proxy_on_vm_start) and create a root context.
     auto *root_context = wasm->start(plugin);
     if (!root_context) {
-      std::cerr << "Failed to start WASM module: " << module_name << std::endl;
+      LOG_ERROR("Failed to start WASM module: " << module_name);
       return false;
     }
 
     // Configure the plugin (calls proxy_on_configure).
     if (!wasm->configure(root_context, plugin)) {
-      std::cerr << "Failed to configure WASM module: " << module_name << std::endl;
+      LOG_ERROR("Failed to configure WASM module: " << module_name);
       return false;
     }
 
@@ -95,11 +96,11 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     state.plugin = plugin;
     modules_[module_name] = std::move(state);
 
-    std::cout << "Module loaded and initialized successfully: " << module_name << std::endl;
+    LOG_INFO("Module loaded and initialized successfully: " << module_name);
     return true;
 
   } catch (const std::exception &e) {
-    std::cerr << "Failed to load module " << module_name << ": " << e.what() << std::endl;
+    LOG_ERROR("Failed to load module " << module_name << ": " << e.what());
     return false;
   }
 }
@@ -108,7 +109,7 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
                                        const std::string &phase) {
   auto it = modules_.find(module_name);
   if (it == modules_.end()) {
-    std::cerr << "Module not found: " << module_name << std::endl;
+    LOG_ERROR("Module not found: " << module_name);
     return false;
   }
 
@@ -116,12 +117,12 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
   auto &wasm = state.wasm;
 
   if (!wasm || wasm->isFailed()) {
-    std::cerr << "Module VM not available or failed: " << module_name << std::endl;
+    LOG_ERROR("Module VM not available or failed: " << module_name);
     return false;
   }
 
-  std::cout << "[WASM] Executing " << phase << " phase for module: " << module_name
-            << " (context_id: " << context_id << ")" << std::endl;
+  LOG_INFO("[WASM] Executing " << phase << " phase for module: " << module_name
+            << " (context_id: " << context_id << ")");
 
   try {
     // For onRequestHeaders, we need to create a stream context and call the filter.
@@ -131,14 +132,14 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
         // Get the root context for this plugin.
         auto *root_ctx = wasm->getRootContext(state.plugin, false);
         if (!root_ctx) {
-          std::cerr << "No root context for module: " << module_name << std::endl;
+          LOG_ERROR("No root context for module: " << module_name);
           return false;
         }
 
         // Create a stream context via proxy_on_context_create.
         auto *ctx = wasm->createContext(state.plugin);
         if (!ctx) {
-          std::cerr << "Failed to create stream context for module: " << module_name << std::endl;
+          LOG_ERROR("Failed to create stream context for module: " << module_name);
           return false;
         }
         ctx->onCreate();
@@ -148,6 +149,7 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
 
         if (state.stream_context) {
           state.stream_context->resetLocalResponse();
+          state.stream_context->resetHeaderMaps();
         }
       }
 
@@ -179,14 +181,13 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
         state.stream_context->onDone();
       }
     } else {
-      std::cout << "[WASM] Unknown phase: " << phase << std::endl;
+      LOG_INFO("[WASM] Unknown phase: " << phase);
     }
 
     return true;
 
   } catch (const std::exception &e) {
-    std::cerr << "[WASM] Error executing " << phase << " for " << module_name << ": " << e.what()
-              << std::endl;
+    LOG_ERROR("[WASM] Error executing " << phase << " for " << module_name << ": " << e.what());
     return false;
   }
 }
@@ -215,15 +216,41 @@ bool WasmModuleManager::hasLocalResponse(const std::string &module_name) const {
   return false;
 }
 
+HeaderPairs WasmModuleManager::getLocalResponseHeaders(const std::string &module_name) const {
+  auto it = modules_.find(module_name);
+  if (it != modules_.end() && it->second.stream_context) {
+    return it->second.stream_context->localResponseHeaders();
+  }
+  return {};
+}
+
+void WasmModuleManager::setContextHeaders(const std::string &module_name,
+                                           proxy_wasm::WasmHeaderMapType type,
+                                           const HeaderPairs &pairs) {
+  auto it = modules_.find(module_name);
+  if (it != modules_.end() && it->second.stream_context) {
+    it->second.stream_context->setHeaderMap(type, pairs);
+  }
+}
+
+HeaderPairs WasmModuleManager::getContextHeaders(const std::string &module_name,
+                                                  proxy_wasm::WasmHeaderMapType type) const {
+  auto it = modules_.find(module_name);
+  if (it != modules_.end() && it->second.stream_context) {
+    return it->second.stream_context->getHeaderMapOwned(type);
+  }
+  return {};
+}
+
 bool WasmModuleManager::unloadModule(const std::string &module_name) {
   auto it = modules_.find(module_name);
   if (it == modules_.end()) {
-    std::cerr << "Module not found: " << module_name << std::endl;
+    LOG_ERROR("Module not found: " << module_name);
     return false;
   }
 
   modules_.erase(it);
-  std::cout << "Module unloaded: " << module_name << std::endl;
+  LOG_INFO("Module unloaded: " << module_name);
   return true;
 }
 

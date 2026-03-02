@@ -36,6 +36,14 @@ enum {
   FilterTrailersStatus_Continue = 0,
 };
 
+// Proxy-Wasm header map types (proxy_header_map_type_t).
+enum {
+  HeaderMapType_RequestHeaders = 0,
+  HeaderMapType_RequestTrailers = 1,
+  HeaderMapType_ResponseHeaders = 2,
+  HeaderMapType_ResponseTrailers = 3,
+};
+
 // Host function imports used by this sample.
 __attribute__((import_module("env"), import_name("proxy_log")))
 extern WasmResult proxy_log(LogLevel level, const char *message, size_t message_size);
@@ -48,6 +56,16 @@ extern WasmResult proxy_send_local_response(uint32_t response_code,
                                              const char *additional_headers_ptr,
                                              size_t additional_headers_size,
                                              uint32_t grpc_status);
+
+__attribute__((import_module("env"), import_name("proxy_add_header_map_value")))
+extern WasmResult proxy_add_header_map_value(uint32_t type,
+                                              const char *key_ptr, size_t key_size,
+                                              const char *value_ptr, size_t value_size);
+
+__attribute__((import_module("env"), import_name("proxy_replace_header_map_value")))
+extern WasmResult proxy_replace_header_map_value(uint32_t type,
+                                                  const char *key_ptr, size_t key_size,
+                                                  const char *value_ptr, size_t value_size);
 
 // WASI environ imports for reading environment variables.
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("environ_sizes_get")))
@@ -268,13 +286,33 @@ WASM_EXPORT FilterTrailersStatus proxy_on_request_trailers(uint32_t context_id, 
 }
 
 WASM_EXPORT FilterHeadersStatus proxy_on_response_headers(uint32_t context_id,
-                                                          uint32_t headers,
-                                                          uint32_t end_of_stream) {
+                                                           uint32_t headers,
+                                                           uint32_t end_of_stream) {
   (void)context_id;
   (void)headers;
   (void)end_of_stream;
-  static const char msg[] = "sample_filter: proxy_on_response_headers";
+  static const char msg[] = "sample_filter: proxy_on_response_headers — adding custom headers";
   log_msg(msg, sizeof(msg) - 1);
+
+  // Demonstrate response header manipulation:
+  // 1. Add a custom header to the response.
+  {
+    static const char key[] = "X-Wasm-Filter";
+    static const char val[] = "sample_filter/active";
+    proxy_add_header_map_value(HeaderMapType_ResponseHeaders,
+                               key, sizeof(key) - 1,
+                               val, sizeof(val) - 1);
+  }
+
+  // 2. Add a powered-by header.
+  {
+    static const char key[] = "X-Powered-By";
+    static const char val[] = "lswasm/proxy-wasm";
+    proxy_add_header_map_value(HeaderMapType_ResponseHeaders,
+                               key, sizeof(key) - 1,
+                               val, sizeof(val) - 1);
+  }
+
   return FilterHeadersStatus_Continue;
 }
 

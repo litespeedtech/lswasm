@@ -4,9 +4,8 @@ project(lswasm LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Options for runtime selection
-option(ENABLE_WASMER "Enable Wasmer runtime support" ON)
-option(ENABLE_WASMTIME "Enable Wasmtime runtime support" ON)
+# WASM runtime selection: "wasmtime" (default), "v8", or "" (Null VM only).
+set(WASM_RUNTIME "wasmtime" CACHE STRING "WASM runtime to use (wasmtime, v8, or empty for Null VM)")
 
 # Find required packages
 find_package(OpenSSL REQUIRED)
@@ -29,19 +28,18 @@ set(PROXY_WASM_SOURCES
   "${PROXY_WASM_HOST_DIR}/src/wasm.cc"
 )
 
-# Detection flags
-set(HAVE_WASMTIME FALSE)
-set(HAVE_WASMER FALSE)
+# Runtime detection flag
+set(HAVE_RUNTIME FALSE)
 
-# Add Wasmtime support if enabled
-if(ENABLE_WASMTIME)
+# ---- Wasmtime ----
+if(WASM_RUNTIME STREQUAL "wasmtime")
   # Try to detect a system-installed wasmtime C library (via CMake config)
   find_package(wasmtime QUIET)
   if(wasmtime_FOUND)
     list(APPEND PROXY_WASM_SOURCES
       "${PROXY_WASM_HOST_DIR}/src/wasmtime/wasmtime.cc"
     )
-    set(HAVE_WASMTIME TRUE)
+    set(HAVE_RUNTIME TRUE)
     message(STATUS "Wasmtime found and enabled")
   else()
     # Fallback: maybe user built wasmtime from source in third_party
@@ -61,23 +59,52 @@ if(ENABLE_WASMTIME)
       list(APPEND PROXY_WASM_SOURCES
         "${PROXY_WASM_HOST_DIR}/src/wasmtime/wasmtime.cc"
       )
-      set(HAVE_WASMTIME TRUE)
+      set(HAVE_RUNTIME TRUE)
       message(STATUS "Using locally built Wasmtime library from ${WASMTIME_SRC_DIR}")
     else()
-      message(STATUS "Wasmtime not found - install via: cargo install wasmtime-cli or apt install libwasmtime-dev")
+      message(FATAL_ERROR "WASM_RUNTIME=wasmtime but Wasmtime not found.\n"
+        "Install via: cargo install wasmtime-cli or apt install libwasmtime-dev")
     endif()
   endif()
-endif()
 
-# Add Wasmer support if enabled
-if(ENABLE_WASMER)
-  find_package(wasmer QUIET)
-  if(wasmer_FOUND)
-    set(HAVE_WASMER TRUE)
-    message(STATUS "Wasmer found and enabled")
+# ---- V8 ----
+elseif(WASM_RUNTIME STREQUAL "v8")
+  find_package(v8 QUIET)
+  if(v8_FOUND)
+    list(APPEND PROXY_WASM_SOURCES
+      "${PROXY_WASM_HOST_DIR}/src/v8/v8.cc"
+    )
+    set(HAVE_RUNTIME TRUE)
+    message(STATUS "V8 found via CMake config and enabled")
   else()
-    message(STATUS "Wasmer not found - install via: curl https://get.wasmer.io -sSfL | sh")
+    # Fallback: try to find V8 via header/library search.
+    find_path(V8_INCLUDE_DIR v8.h
+      PATHS /usr/include /usr/local/include /usr/include/node /usr/include/nodejs/deps/v8/include)
+    find_library(V8_LIBRARY v8
+      PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
+    if(V8_INCLUDE_DIR AND V8_LIBRARY)
+      include_directories(${V8_INCLUDE_DIR})
+      # proxy-wasm-cpp-host V8 backend uses #include "include/v8-*.h", so we also
+      # need the parent of the "include/" directory containing V8 headers.
+      # For Node.js layout: /usr/include/nodejs/deps/v8/include/ → add /usr/include/nodejs/deps/v8/
+      find_path(V8_PARENT_DIR include/v8-initialization.h
+        PATHS /usr/include/nodejs/deps/v8 /usr/local/include)
+      if(V8_PARENT_DIR)
+        include_directories(${V8_PARENT_DIR})
+      endif()
+      list(APPEND PROXY_WASM_SOURCES
+        "${PROXY_WASM_HOST_DIR}/src/v8/v8.cc"
+      )
+      set(HAVE_RUNTIME TRUE)
+      message(STATUS "V8 found at ${V8_INCLUDE_DIR} / ${V8_LIBRARY}")
+    else()
+      message(FATAL_ERROR "WASM_RUNTIME=v8 but V8 not found.\n"
+        "Install the V8 development libraries for your platform.")
+    endif()
   endif()
+
+elseif(NOT WASM_RUNTIME STREQUAL "")
+  message(FATAL_ERROR "Unknown WASM_RUNTIME value: '${WASM_RUNTIME}'. Use 'wasmtime', 'v8', or empty string.")
 endif()
 
 # Add null VM support (always available)
@@ -107,14 +134,26 @@ target_link_libraries(proxy-wasm-host
   PUBLIC OpenSSL::SSL OpenSSL::Crypto
 )
 
-if(HAVE_WASMTIME)
+# Propagate the chosen runtime as a compile definition: WASM_RUNTIME_WASMTIME or WASM_RUNTIME_V8.
+if(WASM_RUNTIME STREQUAL "wasmtime" AND HAVE_RUNTIME)
   target_link_libraries(proxy-wasm-host PUBLIC wasmtime)
-  target_compile_definitions(proxy-wasm-host PUBLIC ENABLE_WASMTIME)
-endif()
-
-if(HAVE_WASMER)
-  target_link_libraries(proxy-wasm-host PUBLIC wasmer)
-  target_compile_definitions(proxy-wasm-host PUBLIC ENABLE_WASMER)
+  target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_WASMTIME)
+elseif(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME)
+  if(v8_FOUND)
+    target_link_libraries(proxy-wasm-host PUBLIC v8)
+  else()
+    target_link_libraries(proxy-wasm-host PUBLIC ${V8_LIBRARY})
+    # V8 typically also needs libv8_libplatform and libv8_libbase.
+    find_library(V8_PLATFORM_LIBRARY v8_libplatform PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
+    find_library(V8_BASE_LIBRARY v8_libbase PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
+    if(V8_PLATFORM_LIBRARY)
+      target_link_libraries(proxy-wasm-host PUBLIC ${V8_PLATFORM_LIBRARY})
+    endif()
+    if(V8_BASE_LIBRARY)
+      target_link_libraries(proxy-wasm-host PUBLIC ${V8_BASE_LIBRARY})
+    endif()
+  endif()
+  target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_V8)
 endif()
 
 # Main executable - HTTP proxy server with proxy-wasm filter support
@@ -139,14 +178,22 @@ target_link_libraries(lswasm PRIVATE
   pthread
 )
 
-if(HAVE_WASMTIME)
+if(WASM_RUNTIME STREQUAL "wasmtime" AND HAVE_RUNTIME)
   target_link_libraries(lswasm PRIVATE wasmtime)
-  target_compile_definitions(lswasm PRIVATE ENABLE_WASMTIME)
-endif()
-
-if(HAVE_WASMER)
-  target_link_libraries(lswasm PRIVATE wasmer)
-  target_compile_definitions(lswasm PRIVATE ENABLE_WASMER)
+  target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_WASMTIME)
+elseif(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME)
+  if(v8_FOUND)
+    target_link_libraries(lswasm PRIVATE v8)
+  else()
+    target_link_libraries(lswasm PRIVATE ${V8_LIBRARY})
+    if(V8_PLATFORM_LIBRARY)
+      target_link_libraries(lswasm PRIVATE ${V8_PLATFORM_LIBRARY})
+    endif()
+    if(V8_BASE_LIBRARY)
+      target_link_libraries(lswasm PRIVATE ${V8_BASE_LIBRARY})
+    endif()
+  endif()
+  target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_V8)
 endif()
 
 # Compilation flags
@@ -159,8 +206,8 @@ endif()
 
 # Print summary
 message(STATUS "=== WASM Proxy Build Configuration ===")
-message(STATUS "Wasmer support: ${HAVE_WASMER}")
-message(STATUS "Wasmtime support: ${HAVE_WASMTIME}")
+message(STATUS "WASM runtime: ${WASM_RUNTIME}")
+message(STATUS "Runtime found: ${HAVE_RUNTIME}")
 message(STATUS "Submodules:")
 message(STATUS "  - proxy-wasm-cpp-host: ${PROXY_WASM_HOST_DIR}")
 message(STATUS "  - proxy-wasm-cpp-sdk: ${PROXY_WASM_SDK_DIR}")

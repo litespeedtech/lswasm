@@ -75,7 +75,7 @@ public:
     void accept_connections() {
         int epoll_fd = epoll_create1(0);
         if (epoll_fd < 0) {
-            std::cerr << "Failed to create epoll fd: " << strerror(errno) << std::endl;
+            LOG_ERROR("Failed to create epoll fd: " << strerror(errno));
             return;
         }
 
@@ -87,7 +87,7 @@ public:
         ev.events = EPOLLIN;
         ev.data.fd = server_socket_;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket_, &ev) < 0) {
-            std::cerr << "Failed to add server socket to epoll: " << strerror(errno) << std::endl;
+            LOG_ERROR("Failed to add server socket to epoll: " << strerror(errno));
             close(epoll_fd);
             return;
         }
@@ -102,7 +102,7 @@ public:
             if (nfds < 0) {
                 if (errno == EINTR) continue;  // Interrupted by signal
                 if (g_shutdown != 0) break;
-                std::cerr << "epoll_wait error: " << strerror(errno) << std::endl;
+                LOG_ERROR("epoll_wait error: " << strerror(errno));
                 break;
             }
 
@@ -122,7 +122,7 @@ public:
                                 break;  // No more pending connections.
                             }
                             if (g_shutdown != 0) break;
-                            std::cerr << "Accept error: " << strerror(errno) << std::endl;
+                            LOG_ERROR("Accept error: " << strerror(errno));
                             break;
                         }
 
@@ -132,8 +132,8 @@ public:
                         client_ev.events = EPOLLIN;
                         client_ev.data.fd = client_socket;
                         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &client_ev) < 0) {
-                            std::cerr << "Failed to add client socket to epoll: "
-                                      << strerror(errno) << std::endl;
+                            LOG_ERROR("Failed to add client socket to epoll: "
+                                      << strerror(errno));
                             close(client_socket);
                             continue;
                         }
@@ -214,13 +214,13 @@ private:
     bool start_tcp() {
         server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_socket_ < 0) {
-            std::cerr << "Failed to create TCP socket" << std::endl;
+            LOG_ERROR("Failed to create TCP socket");
             return false;
         }
 
         int opt = 1;
         if (setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-            std::cerr << "Failed to set socket options" << std::endl;
+            LOG_ERROR("Failed to set socket options");
             close(server_socket_);
             return false;
         }
@@ -232,19 +232,19 @@ private:
 
         if (bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
                  sizeof(server_addr)) < 0) {
-            std::cerr << "Failed to bind TCP socket to port " << port_ << std::endl;
+            LOG_ERROR("Failed to bind TCP socket to port " << port_);
             close(server_socket_);
             return false;
         }
 
         if (listen(server_socket_, BACKLOG) < 0) {
-            std::cerr << "Failed to listen on TCP socket" << std::endl;
+            LOG_ERROR("Failed to listen on TCP socket");
             close(server_socket_);
             return false;
         }
 
         g_server_socket = server_socket_;
-        std::cout << "HTTP Server listening on TCP port " << port_ << std::endl;
+        LOG_INFO("HTTP Server listening on TCP port " << port_);
         return true;
     }
 
@@ -253,7 +253,7 @@ private:
     bool start_uds() {
         server_socket_ = socket(AF_UNIX, SOCK_STREAM, 0);
         if (server_socket_ < 0) {
-            std::cerr << "Failed to create Unix domain socket" << std::endl;
+            LOG_ERROR("Failed to create Unix domain socket");
             return false;
         }
 
@@ -264,9 +264,9 @@ private:
         server_addr.sun_family = AF_UNIX;
 
         if (uds_path_.size() >= sizeof(server_addr.sun_path)) {
-            std::cerr << "Unix socket path too long (max "
+            LOG_ERROR("Unix socket path too long (max "
                       << sizeof(server_addr.sun_path) - 1 << " chars): "
-                      << uds_path_ << std::endl;
+                      << uds_path_);
             close(server_socket_);
             return false;
         }
@@ -275,23 +275,23 @@ private:
 
         if (bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
                  sizeof(server_addr)) < 0) {
-            std::cerr << "Failed to bind Unix domain socket at " << uds_path_
-                      << ": " << strerror(errno) << std::endl;
+            LOG_ERROR("Failed to bind Unix domain socket at " << uds_path_
+                      << ": " << strerror(errno));
             close(server_socket_);
             return false;
         }
 
         // Restrict socket access to the owner only (rw-------).
         if (chmod(uds_path_.c_str(), 0600) != 0) {
-            std::cerr << "Failed to set permissions on Unix domain socket: "
-                      << strerror(errno) << std::endl;
+            LOG_ERROR("Failed to set permissions on Unix domain socket: "
+                      << strerror(errno));
             close(server_socket_);
             cleanup_uds();
             return false;
         }
 
         if (listen(server_socket_, BACKLOG) < 0) {
-            std::cerr << "Failed to listen on Unix domain socket" << std::endl;
+            LOG_ERROR("Failed to listen on Unix domain socket");
             close(server_socket_);
             cleanup_uds();
             return false;
@@ -299,7 +299,7 @@ private:
 
         g_server_socket = server_socket_;
         g_uds_path = uds_path_;
-        std::cout << "HTTP Server listening on Unix socket " << uds_path_ << std::endl;
+        LOG_INFO("HTTP Server listening on Unix socket " << uds_path_);
         return true;
     }
 
@@ -323,7 +323,7 @@ private:
             ssize_t n = ::send(fd, data.c_str() + total_sent,
                                data.size() - total_sent, 0);
             if (n < 0) {
-                std::cerr << "send error: " << strerror(errno) << std::endl;
+                LOG_ERROR("send error: " << strerror(errno));
                 break;
             }
             total_sent += static_cast<size_t>(n);
@@ -350,12 +350,12 @@ private:
         filter_ctx.onCreate();
 
         // Execute phases via context methods
-        std::cout << "\n[HTTP] Processing request in filter chain..." << std::endl;
+        LOG_INFO("\n[HTTP] Processing request in filter chain...");
         filter_ctx.onRequestHeaders();
 
         // If the WASM filter sent a local response, use it directly.
         if (http_data.has_local_response) {
-            std::cout << "[HTTP] WASM filter sent local response, using it." << std::endl;
+            LOG_INFO("[HTTP] WASM filter sent local response, using it.");
             auto response = build_local_response(http_data);
             send_all(client_socket, response);
             return;
@@ -363,19 +363,30 @@ private:
 
         filter_ctx.onRequestBody();
         filter_ctx.onRequestTrailers();
-        filter_ctx.onDone();
 
-        // Generate HTTP response
-        auto response = process_request(http_data);
+        // Generate the response body first.
+        std::string body = build_response_body(http_data);
 
-        // Execute response phases via context
-        std::cout << "[HTTP] Processing response in filter chain..." << std::endl;
+        // Populate default response headers (without Content-Length — added after filter chain).
+        http_data.response_headers.clear();
+        http_data.response_headers.emplace_back("Content-Type", "text/plain");
+        http_data.response_headers.emplace_back("Connection", "close");
+
+        // Execute response phases via context — WASM modules can now modify response_headers.
+        LOG_INFO("[HTTP] Processing response in filter chain...");
         filter_ctx.onResponseHeaders();
         filter_ctx.onResponseBody();
         filter_ctx.onResponseTrailers();
         filter_ctx.onDone();
 
-        // Send HTTP response
+        // Ensure Content-Length is correct after filter chain (remove any stale value, re-add).
+        auto &hdrs = http_data.response_headers;
+        hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+            [](const auto &p) { return header_name_eq(p.first, "Content-Length"); }), hdrs.end());
+        hdrs.emplace_back("Content-Length", std::to_string(body.length()));
+
+        // Serialize the final response using (potentially modified) headers.
+        auto response = serialize_response(200, http_data.response_headers, body);
         send_all(client_socket, response);
     }
 
@@ -405,32 +416,69 @@ private:
                 if (!header_value.empty() && header_value.back() == '\r') {
                     header_value.pop_back();
                 }
-                http_data.request_headers[header_name] = header_value;
+                http_data.request_headers.emplace_back(std::move(header_name), std::move(header_value));
             }
         }
 
         return true;
     }
 
-    // Build an HTTP response from the WASM filter's local response.
-    std::string build_local_response(const HttpData& http_data) {
+    // Map common HTTP status codes to reason phrases.
+    static const char *reason_phrase(uint32_t status_code) {
+        switch (status_code) {
+            case 200: return "OK";
+            case 201: return "Created";
+            case 204: return "No Content";
+            case 301: return "Moved Permanently";
+            case 302: return "Found";
+            case 304: return "Not Modified";
+            case 400: return "Bad Request";
+            case 401: return "Unauthorized";
+            case 403: return "Forbidden";
+            case 404: return "Not Found";
+            case 405: return "Method Not Allowed";
+            case 500: return "Internal Server Error";
+            case 502: return "Bad Gateway";
+            case 503: return "Service Unavailable";
+            default:  return "";
+        }
+    }
+
+    // Serialize an HTTP response from status code, headers, and body.
+    std::string serialize_response(uint32_t status_code, const HeaderPairs &headers,
+                                   const std::string &body) {
         std::ostringstream response;
-        response << "HTTP/1.1 " << http_data.local_response_code << " OK\r\n";
-        response << "Content-Type: text/plain\r\n";
-        response << "X-Powered-By: lswasm/proxy-wasm\r\n";
-        response << "Connection: close\r\n";
-        response << "Content-Length: " << http_data.local_response_body.length() << "\r\n";
+        response << "HTTP/1.1 " << status_code << " " << reason_phrase(status_code) << "\r\n";
+        for (const auto &[key, value] : headers) {
+            response << key << ": " << value << "\r\n";
+        }
         response << "\r\n";
-        response << http_data.local_response_body;
+        response << body;
         return response.str();
     }
 
-    std::string process_request(const HttpData& http_data) {
-        std::ostringstream response;
-        response << "HTTP/1.1 200 OK\r\n";
-        response << "Content-Type: text/plain\r\n";
-        response << "Connection: close\r\n";
+    // Build an HTTP response from the WASM filter's local response.
+    std::string build_local_response(const HttpData& http_data) {
+        HeaderPairs headers;
+        headers.emplace_back("Content-Type", "text/plain");
+        headers.emplace_back("X-Powered-By", "lswasm/proxy-wasm");
+        headers.emplace_back("Connection", "close");
+        // Merge additional headers from sendLocalResponse, but skip reserved names
+        // that are managed by the host to prevent duplicate or conflicting values.
+        for (const auto &h : http_data.local_response_additional_headers) {
+            if (header_name_eq(h.first, "Content-Length") ||
+                header_name_eq(h.first, "Content-Type") ||
+                header_name_eq(h.first, "Connection")) {
+                continue;
+            }
+            headers.emplace_back(h.first, h.second);
+        }
+        headers.emplace_back("Content-Length", std::to_string(http_data.local_response_body.length()));
+        return serialize_response(http_data.local_response_code, headers, http_data.local_response_body);
+    }
 
+    // Build the response body (without headers).
+    std::string build_response_body(const HttpData& http_data) {
         std::string body = "=== WASM HTTP Proxy Server ===\n\n";
         body += "Request Information:\n";
         body += "  Method: " + http_data.method + "\n";
@@ -438,13 +486,11 @@ private:
         body += "  Version: " + http_data.version + "\n\n";
 
         body += "Runtime Information:\n";
-#ifdef ENABLE_WASMTIME
+#if defined(WASM_RUNTIME_WASMTIME)
         body += "  ✓ Wasmtime runtime available\n";
-#endif
-#ifdef ENABLE_WASMER
-        body += "  ✓ Wasmer runtime available\n";
-#endif
-#if !defined(ENABLE_WASMTIME) && !defined(ENABLE_WASMER)
+#elif defined(WASM_RUNTIME_V8)
+        body += "  ✓ V8 runtime available\n";
+#else
         body += "  ℹ No WASM runtime enabled\n";
 #endif
 
@@ -464,6 +510,7 @@ private:
         body += "\nProxy-WASM Support:\n";
         body += "  • RootContext lifecycle callbacks\n";
         body += "  • HTTP filter callbacks (onRequest*, onResponse*)\n";
+        body += "  • Response header manipulation from WASM modules\n";
         body += "  • Connection events\n";
         body += "  • Metadata and data processing\n";
         body += "  • Status/error codes\n\n";
@@ -473,11 +520,7 @@ private:
         body += "  • proxy-wasm-cpp-sdk\n";
         body += "  • proxy-wasm-spec\n";
 
-        response << "Content-Length: " << body.length() << "\r\n";
-        response << "\r\n";
-        response << body;
-
-        return response.str();
+        return body;
     }
 
     Mode mode_;
@@ -502,6 +545,7 @@ int main(int argc, char* argv[]) {
     std::string wasm_module_path;
     std::string uds_path;
     std::unordered_map<std::string, std::string> wasm_envs;
+    bool debug = false;
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -521,9 +565,11 @@ int main(int argc, char* argv[]) {
                 std::string value = env_str.substr(eq_pos + 1);
                 wasm_envs[key] = value;
             } else {
-                std::cerr << "Invalid --env format, expected KEY=VALUE: " << env_str << std::endl;
+                LOG_ERROR("Invalid --env format, expected KEY=VALUE: " << env_str);
                 return 1;
             }
+        } else if (arg == "--debug") {
+            debug = true;
         } else if (arg == "--help") {
             std::cout << "WASM HTTP Proxy Server with Proxy-WASM Support\n";
             std::cout << "Usage: " << argv[0] << " [options]\n";
@@ -532,11 +578,15 @@ int main(int argc, char* argv[]) {
             std::cout << "  --uds PATH       : Listen on Unix domain socket at PATH\n";
             std::cout << "  --module PATH    : Load WASM filter module\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
+            std::cout << "  --debug          : Enable debug logging to " << lswasm_log::LOG_PATH << "\n";
             std::cout << "  --help           : Show this help message\n";
             std::cout << "\nWhen both --port and --uds are given, only --uds is used.\n";
             return 0;
         }
     }
+
+    // Initialize logging: active if /tmp/lshttpd/lswasm.dolog exists or --debug is given.
+    lswasm_log::log_init(debug);
 
     // Set up signal handlers
     signal(SIGINT, signal_handler);
@@ -546,27 +596,25 @@ int main(int argc, char* argv[]) {
     g_module_manager = std::make_unique<WasmModuleManager>();
 
     // Print runtime information
-    std::cout << "\n=== WASM HTTP Proxy Server ===" << std::endl;
-#ifdef ENABLE_WASMTIME
-    std::cout << "✓ Wasmtime runtime enabled" << std::endl;
+    LOG_INFO("\n=== WASM HTTP Proxy Server ===");
+#if defined(WASM_RUNTIME_WASMTIME)
+    LOG_INFO("✓ Wasmtime runtime enabled");
+#elif defined(WASM_RUNTIME_V8)
+    LOG_INFO("✓ V8 runtime enabled");
+#else
+    LOG_INFO("ℹ No WASM runtime enabled (using Null VM)");
 #endif
-#ifdef ENABLE_WASMER
-    std::cout << "✓ Wasmer runtime enabled" << std::endl;
-#endif
-#if !defined(ENABLE_WASMTIME) && !defined(ENABLE_WASMER)
-    std::cout << "ℹ No WASM runtime enabled (using Null VM)" << std::endl;
-#endif
-    std::cout << "Submodules:" << std::endl;
-    std::cout << "  • proxy-wasm-cpp-host" << std::endl;
-    std::cout << "  • proxy-wasm-cpp-sdk" << std::endl;
-    std::cout << "  • proxy-wasm-spec" << std::endl;
-    std::cout << "==============================\n" << std::endl;
+    LOG_INFO("Submodules:");
+    LOG_INFO("  • proxy-wasm-cpp-host");
+    LOG_INFO("  • proxy-wasm-cpp-sdk");
+    LOG_INFO("  • proxy-wasm-spec");
+    LOG_INFO("==============================\n");
 
     // Set environment variables for WASM modules
     if (!wasm_envs.empty()) {
-        std::cout << "WASM environment variables:" << std::endl;
+        LOG_INFO("WASM environment variables:");
         for (const auto &[key, value] : wasm_envs) {
-            std::cout << "  " << key << "=" << value << std::endl;
+            LOG_INFO("  " << key << "=" << value);
         }
         g_module_manager->setEnvironmentVariables(wasm_envs);
     }
@@ -574,11 +622,11 @@ int main(int argc, char* argv[]) {
     // Load WASM module if provided
     if (!wasm_module_path.empty()) {
         std::string module_name = "custom_filter";
-        std::cout << "Loading WASM filter module: " << wasm_module_path << std::endl;
+        LOG_INFO("Loading WASM filter module: " << wasm_module_path);
         if (g_module_manager->loadModule(wasm_module_path, module_name)) {
-            std::cout << "✓ Filter module loaded successfully" << std::endl;
+            LOG_INFO("✓ Filter module loaded successfully");
         } else {
-            std::cerr << "✗ Failed to load filter module" << std::endl;
+            LOG_ERROR("✗ Failed to load filter module");
         }
     }
 
@@ -592,17 +640,17 @@ int main(int argc, char* argv[]) {
         }
 
         if (!server->start()) {
-            std::cerr << "Failed to start HTTP server" << std::endl;
+            LOG_ERROR("Failed to start HTTP server");
             return 1;
         }
 
-        std::cout << "Server ready. Press Ctrl+C to stop.\n" << std::endl;
+        LOG_INFO("Server ready. Press Ctrl+C to stop.\n");
 
         // Accept incoming connections
         server->accept_connections();
 
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        LOG_ERROR("Error: " << e.what());
         return 1;
     }
 
@@ -611,6 +659,6 @@ int main(int argc, char* argv[]) {
         ::unlink(g_uds_path.c_str());
     }
 
-    std::cout << "Server stopped" << std::endl;
+    LOG_INFO("Server stopped");
     return 0;
 }

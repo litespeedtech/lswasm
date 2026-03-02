@@ -19,6 +19,13 @@ lswasm
 # CMake
 CMakeLists.txt.user
 CMakeUserPresets.json
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+samples/Makefile
+
+# Third-party source downloads
+third_party/wasmtime-src/
 
 # macOS
 .DS_Store

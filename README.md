@@ -1,6 +1,6 @@
 # WASM HTTP Proxy Server
 
-A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for both **Wasmer** and **Wasmtime** runtimes.
+A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for **Wasmtime** and **V8** runtimes.
 
 ## Features
 
@@ -8,7 +8,8 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 - TCP and **Unix domain socket** listeners
 - WASM filter module loading and execution via proxy-wasm-cpp-host
 - HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
-- Support for both Wasmer and Wasmtime runtimes
+- **Response header manipulation** from WASM modules via proxy-wasm ABI
+- Support for Wasmtime and V8 runtimes (selectable via `-DWASM_RUNTIME=`)
 - Per-module environment variables (`--env KEY=VALUE`)
 - Graceful shutdown with signal handling (SIGINT, SIGTERM)
 - Modular CMake-based build system
@@ -54,7 +55,7 @@ brew install cmake openssl pkg-config
 
 ### WASM Runtimes
 
-#### Wasmtime (Recommended)
+#### Wasmtime (Default)
 
 ```bash
 # Install Wasmtime
@@ -70,20 +71,11 @@ cd wasmtime
 cargo install --path crates/cli
 ```
 
-#### Wasmer
+#### V8
 
 ```bash
-# Install Wasmer
-curl https://get.wasmer.io -sSfL | sh
-
-# And development files
-# Ubuntu/Debian
-sudo apt-get install -y libwasmer-dev
-
-# Or from source
-git clone https://github.com/wasmerio/wasmer.git
-cd wasmer
-make install
+# Install V8 development libraries for your platform.
+# See https://v8.dev/docs/build for details.
 ```
 
 ## Building
@@ -105,45 +97,21 @@ cd build
 
 ### 3. Configure and Build
 
-#### With Both Runtimes (Default)
+#### With Wasmtime (Default)
 
 ```bash
 cmake .. \
-  -DENABLE_WASMER=ON \
-  -DENABLE_WASMTIME=ON \
+  -DWASM_RUNTIME=wasmtime \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build . -j$(nproc)
 ```
 
-#### Wasmtime Only
+#### With V8
 
 ```bash
 cmake .. \
-  -DENABLE_WASMER=OFF \
-  -DENABLE_WASMTIME=ON \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build . -j$(nproc)
-```
-
-#### Wasmer Only
-
-```bash
-cmake .. \
-  -DENABLE_WASMER=ON \
-  -DENABLE_WASMTIME=OFF \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build . -j$(nproc)
-```
-
-#### Minimal Build (Null VM - No WASM Runtime)
-
-```bash
-cmake .. \
-  -DENABLE_WASMER=OFF \
-  -DENABLE_WASMTIME=OFF \
+  -DWASM_RUNTIME=v8 \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build . -j$(nproc)
@@ -216,16 +184,15 @@ echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
 
 The CMakeLists.txt provides the following options:
 
-- `ENABLE_WASMER` (ON/OFF) - Enable Wasmer runtime support
-- `ENABLE_WASMTIME` (ON/OFF) - Enable Wasmtime runtime support
+- `WASM_RUNTIME` (string) - WASM runtime to use: `wasmtime` (default), `v8`, or empty string for Null VM
 - `CMAKE_BUILD_TYPE` - Release or Debug build
 
-Build output will show which runtimes are enabled:
+Build output will show the selected runtime:
 
 ```
 === WASM Proxy Build Configuration ===
-Wasmer support: ON
-Wasmtime support: ON
+WASM runtime: wasmtime
+Runtime found: TRUE
 =========================================
 ```
 
@@ -315,9 +282,14 @@ Failed to bind socket to port 8080
 
 - [x] Load and execute actual WASM modules from files
 - [x] WASM module lifecycle management (load, unload, reload)
-- [ ] HTTP path routing to different WASM modules
-- [ ] Response header manipulation from WASM modules
-- [ ] Support for additional WASM runtimes (WasmEdge, WAMR)
+- [x] Response header manipulation from WASM modules — WASM filters can
+  add, replace, or remove HTTP response headers via the proxy-wasm ABI
+  (`proxy_add_header_map_value`, `proxy_replace_header_map_value`,
+  `proxy_remove_header_map_value`). Headers are synced between
+  [`HttpData`](src/http_filter.h:18) and the WASM context before/after
+  filter execution, and the response is serialized from the (potentially
+  modified) header map.
+- [ ] Support for additional WASM runtimes (WasmEdge, WAMR, etc.)
 - [ ] TLS/HTTPS support
 - [ ] Configuration file support (YAML/JSON)
 - [ ] Metrics and logging

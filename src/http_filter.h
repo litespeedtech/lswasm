@@ -5,19 +5,23 @@
 #include <map>
 #include <memory>
 #include <iostream>
+#include <utility>
 
 #include "wasm_module_manager.h"  // need full definition for callbacks
+#include "log.h"
 
 // Global module manager instance (defined in main.cpp)
 extern std::unique_ptr<WasmModuleManager> g_module_manager;
+
+// HeaderPairs is defined in wasm_module_manager.h
 
 // HTTP Request/Response data structure
 struct HttpData {
   std::string method;
   std::string path;
   std::string version;
-  std::map<std::string, std::string> request_headers;
-  std::map<std::string, std::string> response_headers;
+  HeaderPairs request_headers;
+  HeaderPairs response_headers;
   std::string request_body;
   std::string response_body;
 
@@ -25,6 +29,7 @@ struct HttpData {
   bool has_local_response = false;
   uint32_t local_response_code = 0;
   std::string local_response_body;
+  HeaderPairs local_response_additional_headers;
 };
 
 /**
@@ -42,11 +47,11 @@ public:
 
   // Lifecycle callbacks
   void onCreate() {
-    std::cout << "[Filter] Context created (ID: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Context created (ID: " << context_id_ << ")");
   }
 
   void onDelete() {
-    std::cout << "[Filter] Context deleted (ID: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Context deleted (ID: " << context_id_ << ")");
   }
 
   // HTTP stream lifecycle hooks (filter callback points)
@@ -58,10 +63,16 @@ public:
   //   entire chain immediately if a prior phase already produced a local
   //   response.
   void onRequestHeaders() {
-    std::cout << "[Filter] onRequestHeaders called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onRequestHeaders called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        // Push request headers into the WASM context before execution.
+        g_module_manager->setContextHeaders(
+            m, proxy_wasm::WasmHeaderMapType::RequestHeaders, http_data_->request_headers);
         g_module_manager->executeFilter(m, context_id_, "onRequestHeaders");
+        // Pull back any modifications the WASM module made to request headers.
+        http_data_->request_headers = g_module_manager->getContextHeaders(
+            m, proxy_wasm::WasmHeaderMapType::RequestHeaders);
         // Check if the WASM module sent a local response.
         checkLocalResponse(m);
         if (http_data_->has_local_response) break;  // Stop filter chain
@@ -70,7 +81,7 @@ public:
   }
 
   void onRequestBody() {
-    std::cout << "[Filter] onRequestBody called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onRequestBody called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
@@ -80,7 +91,7 @@ public:
   }
 
   void onRequestTrailers() {
-    std::cout << "[Filter] onRequestTrailers called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onRequestTrailers called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
@@ -90,17 +101,23 @@ public:
   }
 
   void onResponseHeaders() {
-    std::cout << "[Filter] onResponseHeaders called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onResponseHeaders called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
+        // Push response headers into the WASM context before execution.
+        g_module_manager->setContextHeaders(
+            m, proxy_wasm::WasmHeaderMapType::ResponseHeaders, http_data_->response_headers);
         g_module_manager->executeFilter(m, context_id_, "onResponseHeaders");
+        // Pull back any modifications the WASM module made to response headers.
+        http_data_->response_headers = g_module_manager->getContextHeaders(
+            m, proxy_wasm::WasmHeaderMapType::ResponseHeaders);
       }
     }
   }
 
   void onResponseBody() {
-    std::cout << "[Filter] onResponseBody called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onResponseBody called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
@@ -110,7 +127,7 @@ public:
   }
 
   void onResponseTrailers() {
-    std::cout << "[Filter] onResponseTrailers called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onResponseTrailers called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
@@ -120,7 +137,7 @@ public:
   }
 
   void onDone() {
-    std::cout << "[Filter] Stream processing complete (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Stream processing complete (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onDone");
@@ -130,7 +147,7 @@ public:
 
   // Metadata handling
   void onRequestMetadata() {
-    std::cout << "[Filter] onRequestMetadata called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onRequestMetadata called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onRequestMetadata");
@@ -139,7 +156,7 @@ public:
   }
 
   void onResponseMetadata() {
-    std::cout << "[Filter] onResponseMetadata called (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] onResponseMetadata called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onResponseMetadata");
@@ -149,7 +166,7 @@ public:
 
   // Connection events
   void onNewConnection() {
-    std::cout << "[Filter] New connection (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] New connection (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onNewConnection");
@@ -158,7 +175,7 @@ public:
   }
 
   void onDownstreamConnectionClose() {
-    std::cout << "[Filter] Downstream connection closed (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Downstream connection closed (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onDownstreamConnectionClose");
@@ -167,7 +184,7 @@ public:
   }
 
   void onUpstreamConnectionClose() {
-    std::cout << "[Filter] Upstream connection closed (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Upstream connection closed (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onUpstreamConnectionClose");
@@ -177,7 +194,7 @@ public:
 
   // Data events
   void onDownstreamData() {
-    std::cout << "[Filter] Downstream data (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Downstream data (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onDownstreamData");
@@ -186,7 +203,7 @@ public:
   }
 
   void onUpstreamData() {
-    std::cout << "[Filter] Upstream data (context_id: " << context_id_ << ")" << std::endl;
+    LOG_INFO("[Filter] Upstream data (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onUpstreamData");
@@ -205,9 +222,13 @@ private:
       http_data_->has_local_response = true;
       http_data_->local_response_code = g_module_manager->getLocalResponseCode(module_name);
       http_data_->local_response_body = g_module_manager->getLocalResponseBody(module_name);
-      std::cout << "[Filter] WASM module '" << module_name
+      http_data_->local_response_additional_headers =
+          g_module_manager->getLocalResponseHeaders(module_name);
+      LOG_INFO("[Filter] WASM module '" << module_name
                 << "' sent local response (code=" << http_data_->local_response_code
-                << ", body_size=" << http_data_->local_response_body.size() << ")" << std::endl;
+                << ", body_size=" << http_data_->local_response_body.size()
+                << ", additional_headers=" << http_data_->local_response_additional_headers.size()
+                << ")");
     }
   }
 
@@ -228,27 +249,27 @@ public:
 
   // Plugin lifecycle
   void onConfigure(size_t configuration_size) {
-    std::cout << "[Filter] Plugin configured (config size: " << configuration_size << ")" << std::endl;
+    LOG_INFO("[Filter] Plugin configured (config size: " << configuration_size << ")");
   }
 
   void onStart(size_t vm_configuration_size) {
-    std::cout << "[Filter] Plugin started (VM config size: " << vm_configuration_size << ")" << std::endl;
+    LOG_INFO("[Filter] Plugin started (VM config size: " << vm_configuration_size << ")");
   }
 
   void validateConfiguration(size_t configuration_size) {
-    std::cout << "[Filter] Validating configuration (size: " << configuration_size << ")" << std::endl;
+    LOG_INFO("[Filter] Validating configuration (size: " << configuration_size << ")");
   }
 
   void onTick() {
-    std::cout << "[Filter] Tick event" << std::endl;
+    LOG_INFO("[Filter] Tick event");
   }
 
   void onQueueReady(uint32_t token) {
-    std::cout << "[Filter] Queue ready (token: " << token << ")" << std::endl;
+    LOG_INFO("[Filter] Queue ready (token: " << token << ")");
   }
 
   void onDone() {
-    std::cout << "[Filter] Plugin done" << std::endl;
+    LOG_INFO("[Filter] Plugin done");
   }
 
   // Accessors
