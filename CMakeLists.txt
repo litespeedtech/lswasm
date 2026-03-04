@@ -372,6 +372,19 @@ elseif(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME)
   target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_V8)
 endif()
 
+# V8 snapshot blob: when V8 is built with V8_USE_EXTERNAL_STARTUP_DATA (the
+# default), a snapshot_blob.bin file must be present next to the executable at
+# runtime.  Copy it from the V8 build tree automatically.
+if(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME AND V8_ROOT AND IS_DIRECTORY "${V8_ROOT}")
+  set(V8_SNAPSHOT_BLOB "${V8_BUILD_DIR}/snapshot_blob.bin")
+  if(EXISTS "${V8_SNAPSHOT_BLOB}")
+    add_custom_command(TARGET lswasm POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${V8_SNAPSHOT_BLOB}" "$<TARGET_FILE_DIR:lswasm>/snapshot_blob.bin"
+      COMMENT "Copying V8 snapshot_blob.bin next to lswasm binary")
+  endif()
+endif()
+
 # Compilation flags
 if(UNIX)
   if(APPLE)

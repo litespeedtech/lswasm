@@ -59,11 +59,11 @@ inline void log_init(bool debug = false) {
  * Return a timestamp string in the form "YYYY-MM-DD HH:MM:SS.MMMMMM".
  */
 inline std::string timestamp() {
-  auto now = std::chrono::system_clock::now();
-  auto time_t_now = std::chrono::system_clock::to_time_t(now);
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                now.time_since_epoch()) %
-            std::chrono::seconds(1);
+  std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+  std::time_t time_t_now = std::chrono::system_clock::to_time_t(now);
+  std::chrono::microseconds us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                     now.time_since_epoch()) %
+                                 std::chrono::seconds(1);
   std::tm tm_buf{};
   ::localtime_r(&time_t_now, &tm_buf);
   std::ostringstream oss;
@@ -88,7 +88,7 @@ inline void log_info(const std::string &msg) {
  * Each line is prefixed with a timestamp.
  */
 inline void log_error(const std::string &msg) {
-  auto ts = timestamp();
+  std::string ts = timestamp();
   std::cerr << ts << " " << msg << std::endl;
   if (g_logging_enabled && g_log_file.is_open()) {
     g_log_file << ts << " " << msg << std::endl;

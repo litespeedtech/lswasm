@@ -94,8 +94,8 @@ std::string build_environ_body() {
   }
 
   // Heap-allocate buffers using the actual sizes from the WASI call.
-  auto env_ptrs = std::make_unique<uint8_t *[]>(env_count);
-  auto env_buf = std::make_unique<uint8_t[]>(env_buf_size);
+  std::unique_ptr<uint8_t *[]> env_ptrs = std::make_unique<uint8_t *[]>(env_count);
+  std::unique_ptr<uint8_t[]> env_buf = std::make_unique<uint8_t[]>(env_buf_size);
 
   if (__wasi_environ_get(env_ptrs.get(), env_buf.get()) != 0) {
     body += "Error: failed to retrieve environment variables\n";
@@ -103,7 +103,7 @@ std::string build_environ_body() {
   }
 
   for (__wasi_size_t i = 0; i < env_count; ++i) {
-    auto *entry = reinterpret_cast<const char *>(env_ptrs[i]);
+    const char *entry = reinterpret_cast<const char *>(env_ptrs[i]);
     if (entry) {
       body += "  ";
       body += entry;
@@ -120,12 +120,12 @@ std::string build_header_body() {
 
   body += "\n\n=== Request Headers ===\n\n";
 
-  auto result = getRequestHeaderPairs();
-  auto pairs = result->pairs();
+  WasmDataPtr result = getRequestHeaderPairs();
+  std::vector<std::pair<std::string_view, std::string_view>> pairs = result->pairs();
 
   body += "Header count: " + std::to_string(pairs.size()) + "\n\n";
 
-  for (const auto &p : pairs) {
+  for (const std::pair<std::string_view, std::string_view> &p : pairs) {
     body += "  ";
     body += std::string(p.first);
     body += ": ";

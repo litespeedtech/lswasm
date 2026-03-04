@@ -80,9 +80,11 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
 
     // Create a VM instance for the configured runtime.
 #if defined(WASM_RUNTIME_WASMTIME)
-    auto vm = proxy_wasm::createWasmtimeVm();
+    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWasmtimeVm();
 #elif defined(WASM_RUNTIME_V8)
-    auto vm = proxy_wasm::createV8Vm();
+    LOG_INFO("Creating V8VM");
+    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createV8Vm();
+    LOG_INFO("Created V8VM");
 #else
     LOG_ERROR("No WASM runtime available (build with -DWASM_RUNTIME=wasmtime or -DWASM_RUNTIME=v8)");
     return false;
@@ -92,17 +94,19 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     vm->integration() = std::make_unique<lswasm::LsWasmIntegration>();
 
     // Create the WasmBase with environment variables.
-    auto wasm = std::make_shared<lswasm::LsWasm>(
+    std::shared_ptr<lswasm::LsWasm> wasm = std::make_shared<lswasm::LsWasm>(
         std::move(vm), envs_, module_name, /*vm_configuration=*/"", /*vm_key=*/module_name);
 
     // Load the WASM bytecode.
     std::string bytecode(reinterpret_cast<const char *>(code), code_size);
+    LOG_INFO("Loading bytecode");
     if (!wasm->load(bytecode, /*allow_precompiled=*/false)) {
       LOG_ERROR("Failed to load WASM bytecode for module: " << module_name);
       return false;
     }
 
     // Initialize the VM (registers ABI callbacks, links imports, runs _initialize).
+    LOG_INFO("Initializing...");
     if (!wasm->initialize()) {
       LOG_ERROR("Failed to initialize WASM module: " << module_name);
       return false;
@@ -113,7 +117,8 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     // The proxy-wasm-cpp-sdk default is "" (empty string).  If the WASM module
     // registers its factories with a specific root_id, this should be made
     // configurable.  Using "" here matches the common SDK default.
-    auto plugin = std::make_shared<proxy_wasm::PluginBase>(
+    LOG_INFO("Making plugin");
+    std::shared_ptr<proxy_wasm::PluginBase> plugin = std::make_shared<proxy_wasm::PluginBase>(
         /*name=*/module_name,
         /*root_id=*/"",
         /*vm_id=*/module_name,
@@ -129,13 +134,15 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
         /*key=*/module_name);
 
     // Start the VM (calls proxy_on_vm_start) and create a root context.
-    auto *root_context = wasm->start(plugin);
+    LOG_INFO("Starting VM and creating root context...");
+    proxy_wasm::ContextBase *root_context = wasm->start(plugin);
     if (!root_context) {
       LOG_ERROR("Failed to start WASM module: " << module_name);
       return false;
     }
 
     // Configure the plugin (calls proxy_on_configure).
+    LOG_INFO("Configuring plugin...");
     if (!wasm->configure(root_context, plugin)) {
       LOG_ERROR("Failed to configure WASM module: " << module_name);
       return false;
@@ -156,14 +163,14 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
 }
 
 bool WasmModuleManager::ensureStreamContext(const std::string &module_name, uint32_t context_id) {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
   if (it == modules_.end()) {
     LOG_ERROR("Module not found: " << module_name);
     return false;
   }
 
-  auto &state = it->second;
-  auto &wasm = state.wasm;
+  ModuleState &state = it->second;
+  std::shared_ptr<lswasm::LsWasm> &wasm = state.wasm;
 
   if (!wasm || wasm->isFailed()) {
     LOG_ERROR("Module VM not available or failed: " << module_name);
@@ -176,7 +183,7 @@ bool WasmModuleManager::ensureStreamContext(const std::string &module_name, uint
   }
 
   // Get the root context for this plugin.
-  auto *root_ctx = wasm->getRootContext(state.plugin, false);
+  proxy_wasm::ContextBase *root_ctx = wasm->getRootContext(state.plugin, false);
   if (!root_ctx) {
     LOG_ERROR("No root context for module: " << module_name);
     return false;
@@ -189,13 +196,13 @@ bool WasmModuleManager::ensureStreamContext(const std::string &module_name, uint
   // root context BEFORE calling onCreate(), so that
   // proxy_on_context_create(stream_id, root_id) passes the correct
   // root_context_id to the in-VM SDK.
-  auto *ctx = wasm->createContext(state.plugin);
+  proxy_wasm::ContextBase *ctx = wasm->createContext(state.plugin);
   if (!ctx) {
     LOG_ERROR("Failed to create stream context for module: " << module_name);
     return false;
   }
 
-  auto *lswasm_ctx = dynamic_cast<lswasm::LsWasmContext *>(ctx);
+  lswasm::LsWasmContext *lswasm_ctx = dynamic_cast<lswasm::LsWasmContext *>(ctx);
   if (lswasm_ctx) {
     lswasm_ctx->setParentContext(root_ctx);
   }
@@ -215,14 +222,14 @@ bool WasmModuleManager::ensureStreamContext(const std::string &module_name, uint
 
 bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t context_id,
                                        const std::string &phase) {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
   if (it == modules_.end()) {
     LOG_ERROR("Module not found: " << module_name);
     return false;
   }
 
-  auto &state = it->second;
-  auto &wasm = state.wasm;
+  ModuleState &state = it->second;
+  std::shared_ptr<lswasm::LsWasm> &wasm = state.wasm;
 
   if (!wasm || wasm->isFailed()) {
     LOG_ERROR("Module VM not available or failed: " << module_name);
@@ -279,7 +286,7 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
 }
 
 std::string WasmModuleManager::getLocalResponseBody(const std::string &module_name) const {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
   if (it != modules_.end() && it->second.stream_context) {
     return it->second.stream_context->localResponseBody();
   }
@@ -287,7 +294,7 @@ std::string WasmModuleManager::getLocalResponseBody(const std::string &module_na
 }
 
 uint32_t WasmModuleManager::getLocalResponseCode(const std::string &module_name) const {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
   if (it != modules_.end() && it->second.stream_context) {
     return it->second.stream_context->localResponseCode();
   }
@@ -295,7 +302,7 @@ uint32_t WasmModuleManager::getLocalResponseCode(const std::string &module_name)
 }
 
 bool WasmModuleManager::hasLocalResponse(const std::string &module_name) const {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
   if (it != modules_.end() && it->second.stream_context) {
     return it->second.stream_context->hasLocalResponse();
   }
@@ -303,7 +310,7 @@ bool WasmModuleManager::hasLocalResponse(const std::string &module_name) const {
 }
 
 HeaderPairs WasmModuleManager::getLocalResponseHeaders(const std::string &module_name) const {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
   if (it != modules_.end() && it->second.stream_context) {
     return it->second.stream_context->localResponseHeaders();
   }
@@ -313,15 +320,15 @@ HeaderPairs WasmModuleManager::getLocalResponseHeaders(const std::string &module
 void WasmModuleManager::setContextHeaders(const std::string &module_name,
                                            proxy_wasm::WasmHeaderMapType type,
                                            const HeaderPairs &pairs) {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
   if (it != modules_.end() && it->second.stream_context) {
     it->second.stream_context->setHeaderMap(type, pairs);
   }
 }
 
 HeaderPairs WasmModuleManager::getContextHeaders(const std::string &module_name,
-                                                  proxy_wasm::WasmHeaderMapType type) const {
-  auto it = modules_.find(module_name);
+                                                   proxy_wasm::WasmHeaderMapType type) const {
+  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
   if (it != modules_.end() && it->second.stream_context) {
     return it->second.stream_context->getHeaderMapOwned(type);
   }
@@ -329,7 +336,7 @@ HeaderPairs WasmModuleManager::getContextHeaders(const std::string &module_name,
 }
 
 bool WasmModuleManager::unloadModule(const std::string &module_name) {
-  auto it = modules_.find(module_name);
+  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
   if (it == modules_.end()) {
     LOG_ERROR("Module not found: " << module_name);
     return false;
@@ -342,7 +349,7 @@ bool WasmModuleManager::unloadModule(const std::string &module_name) {
 
 std::vector<std::string> WasmModuleManager::getLoadedModules() const {
   std::vector<std::string> result;
-  for (const auto &pair : modules_) {
+  for (const std::pair<const std::string, ModuleState> &pair : modules_) {
     result.push_back(pair.first);
   }
   return result;

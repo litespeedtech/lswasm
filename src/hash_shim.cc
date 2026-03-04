@@ -14,7 +14,7 @@ std::string BytesToHex(const std::vector<uint8_t> &bytes) {
   static const char *const hex = "0123456789ABCDEF";
   std::string result;
   result.reserve(bytes.size() * 2);
-  for (auto byte : bytes) {
+  for (uint8_t byte : bytes) {
     result.push_back(hex[byte >> 4]);
     result.push_back(hex[byte & 0xf]);
   }
@@ -37,7 +37,7 @@ std::vector<uint8_t> Sha256(const std::vector<std::string_view> &parts) {
     return std::vector<uint8_t>();
   }
 
-  for (const auto &part : parts) {
+  for (const std::string_view &part : parts) {
     if (EVP_DigestUpdate(hash_ctx, part.data(), part.size()) == 0) {
       EVP_MD_CTX_free(hash_ctx);
       return std::vector<uint8_t>();

@@ -20,6 +20,10 @@
 #include <csignal>
 #include <cerrno>
 
+#if defined(WASM_RUNTIME_V8)
+#include "v8-initialization.h"
+#endif
+
 #include "http_filter.h"
 #include "wasm_module_manager.h"
 
@@ -260,7 +264,7 @@ private:
         }
 
         // Ensure the parent directory exists (e.g. /tmp/lshttpd/).
-        auto parent = std::filesystem::path(uds_path_).parent_path();
+        std::filesystem::path parent = std::filesystem::path(uds_path_).parent_path();
         if (!parent.empty()) {
             std::error_code ec;
             std::filesystem::create_directories(parent, ec);
@@ -371,7 +375,7 @@ private:
         // If the WASM filter sent a local response, use it directly.
         if (http_data.has_local_response) {
             LOG_INFO("[HTTP] WASM filter sent local response, using it.");
-            auto response = build_local_response(http_data);
+            std::string response = build_local_response(http_data);
             send_all(client_socket, response);
             return;
         }
@@ -395,13 +399,13 @@ private:
         filter_ctx.onDone();
 
         // Ensure Content-Length is correct after filter chain (remove any stale value, re-add).
-        auto &hdrs = http_data.response_headers;
+        HeaderPairs &hdrs = http_data.response_headers;
         hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
-            [](const auto &p) { return header_name_eq(p.first, "Content-Length"); }), hdrs.end());
+            [](const std::pair<std::string, std::string> &p) { return header_name_eq(p.first, "Content-Length"); }), hdrs.end());
         hdrs.emplace_back("Content-Length", std::to_string(body.length()));
 
         // Serialize the final response using (potentially modified) headers.
-        auto response = serialize_response(200, http_data.response_headers, body);
+        std::string response = serialize_response(200, http_data.response_headers, body);
         send_all(client_socket, response);
     }
 
@@ -483,7 +487,7 @@ private:
         headers.emplace_back("Connection", "close");
         // Merge additional headers from sendLocalResponse, but skip reserved names
         // that are managed by the host to prevent duplicate or conflicting values.
-        for (const auto &h : http_data.local_response_additional_headers) {
+        for (const std::pair<std::string, std::string> &h : http_data.local_response_additional_headers) {
             if (header_name_eq(h.first, "Content-Length") ||
                 header_name_eq(h.first, "Content-Type") ||
                 header_name_eq(h.first, "Connection")) {
@@ -514,12 +518,12 @@ private:
 
         body += "\nFilter Status:\n";
         if (g_module_manager) {
-            auto modules = g_module_manager->getLoadedModules();
+            std::vector<std::string> modules = g_module_manager->getLoadedModules();
             if (modules.empty()) {
                 body += "  • No filters loaded\n";
             } else {
                 body += "  Loaded filters:\n";
-                for (const auto &module : modules) {
+                for (const std::string &module : modules) {
                     body += "    - " + module + "\n";
                 }
             }
@@ -608,6 +612,13 @@ int main(int argc, char* argv[]) {
 
     // Initialize logging: active if /tmp/lshttpd/lswasm.dolog exists or --debug is given.
     lswasm_log::log_init(debug);
+
+#if defined(WASM_RUNTIME_V8)
+    // V8 built with V8_USE_EXTERNAL_STARTUP_DATA requires a snapshot blob
+    // (snapshot_blob.bin) at runtime.  Tell V8 to look for it in the same
+    // directory as the executable.
+    v8::V8::InitializeExternalStartupData(argv[0]);
+#endif
 
     // Set up signal handlers
     signal(SIGINT, signal_handler);

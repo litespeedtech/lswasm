@@ -223,7 +223,7 @@ public:
     local_response_details_ = std::string(details);
     // Convert string_view pairs to owned strings.
     local_response_headers_.clear();
-    for (const auto &h : additional_headers) {
+    for (const std::pair<std::string_view, std::string_view> &h : additional_headers) {
       local_response_headers_.emplace_back(std::string(h.first), std::string(h.second));
     }
     has_local_response_ = true;
@@ -240,9 +240,9 @@ public:
   proxy_wasm::WasmResult getHeaderMapPairs(proxy_wasm::WasmHeaderMapType type,
                                            proxy_wasm::Pairs *result) override {
     result->clear();
-    auto it = header_maps_.find(type);
+    std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs>::const_iterator it = header_maps_.find(type);
     if (it != header_maps_.end()) {
-      for (const auto &p : it->second) {
+      for (const std::pair<std::string, std::string> &p : it->second) {
         result->emplace_back(std::string_view(p.first), std::string_view(p.second));
       }
     }
@@ -251,9 +251,9 @@ public:
 
   proxy_wasm::WasmResult setHeaderMapPairs(proxy_wasm::WasmHeaderMapType type,
                                            const proxy_wasm::Pairs &pairs) override {
-    auto &owned = header_maps_[type];
+    HeaderPairs &owned = header_maps_[type];
     owned.clear();
-    for (const auto &p : pairs) {
+    for (const std::pair<std::string_view, std::string_view> &p : pairs) {
       owned.emplace_back(std::string(p.first), std::string(p.second));
     }
     return proxy_wasm::WasmResult::Ok;
@@ -262,9 +262,9 @@ public:
   proxy_wasm::WasmResult getHeaderMapValue(proxy_wasm::WasmHeaderMapType type,
                                            std::string_view key,
                                            std::string_view *result) override {
-    auto it = header_maps_.find(type);
+    std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs>::const_iterator it = header_maps_.find(type);
     if (it != header_maps_.end()) {
-      for (const auto &pair : it->second) {
+      for (const std::pair<std::string, std::string> &pair : it->second) {
         if (header_name_eq(pair.first, key)) {
           // Return view into owned string — valid until map is modified.
           *result = std::string_view(pair.second);
@@ -286,10 +286,10 @@ public:
   proxy_wasm::WasmResult replaceHeaderMapValue(proxy_wasm::WasmHeaderMapType type,
                                                std::string_view key,
                                                std::string_view value) override {
-    auto &pairs = header_maps_[type];
+    HeaderPairs &pairs = header_maps_[type];
     // Remove all existing occurrences of this key (handles multi-value headers).
     pairs.erase(std::remove_if(pairs.begin(), pairs.end(),
-                               [&key](const auto &p) { return header_name_eq(p.first, key); }),
+                                [&key](const std::pair<std::string, std::string> &p) { return header_name_eq(p.first, key); }),
                 pairs.end());
     // Add a single replacement value.
     pairs.emplace_back(std::string(key), std::string(value));
@@ -298,11 +298,11 @@ public:
 
   proxy_wasm::WasmResult removeHeaderMapValue(proxy_wasm::WasmHeaderMapType type,
                                               std::string_view key) override {
-    auto it = header_maps_.find(type);
+    std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs>::iterator it = header_maps_.find(type);
     if (it != header_maps_.end()) {
-      auto &pairs = it->second;
+      HeaderPairs &pairs = it->second;
       pairs.erase(std::remove_if(pairs.begin(), pairs.end(),
-                                 [&key](const auto &p) { return header_name_eq(p.first, key); }),
+                                  [&key](const std::pair<std::string, std::string> &p) { return header_name_eq(p.first, key); }),
                   pairs.end());
     }
     return proxy_wasm::WasmResult::Ok;
@@ -310,11 +310,11 @@ public:
 
   proxy_wasm::WasmResult getHeaderMapSize(proxy_wasm::WasmHeaderMapType type,
                                           uint32_t *result) override {
-    auto it = header_maps_.find(type);
+    std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs>::const_iterator it = header_maps_.find(type);
     if (it != header_maps_.end()) {
       // Size in bytes: sum of key + value lengths + 4 bytes per pair for NULs.
       uint32_t size = 0;
-      for (const auto &pair : it->second) {
+      for (const std::pair<std::string, std::string> &pair : it->second) {
         size += pair.first.size() + pair.second.size() + 4;
       }
       *result = size;
@@ -333,7 +333,7 @@ public:
 
   /** Get the header map for a given type (used by the host to read after filter execution). */
   HeaderPairs getHeaderMapOwned(proxy_wasm::WasmHeaderMapType type) const {
-    auto it = header_maps_.find(type);
+    std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs>::const_iterator it = header_maps_.find(type);
     return it != header_maps_.end() ? it->second : HeaderPairs{};
   }
 

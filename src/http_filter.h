@@ -65,7 +65,7 @@ public:
   void onRequestHeaders() {
     LOG_INFO("[Filter] onRequestHeaders called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         // Ensure the stream context exists *before* setting headers.
         // executeFilter() used to lazily create the context, which meant
         // setContextHeaders() found no stream_context and silently dropped
@@ -88,7 +88,7 @@ public:
   void onRequestBody() {
     LOG_INFO("[Filter] onRequestBody called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onRequestBody");
       }
@@ -98,7 +98,7 @@ public:
   void onRequestTrailers() {
     LOG_INFO("[Filter] onRequestTrailers called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onRequestTrailers");
       }
@@ -108,7 +108,7 @@ public:
   void onResponseHeaders() {
     LOG_INFO("[Filter] onResponseHeaders called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
         // Push response headers into the WASM context before execution.
         g_module_manager->setContextHeaders(
@@ -124,7 +124,7 @@ public:
   void onResponseBody() {
     LOG_INFO("[Filter] onResponseBody called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onResponseBody");
       }
@@ -134,7 +134,7 @@ public:
   void onResponseTrailers() {
     LOG_INFO("[Filter] onResponseTrailers called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         if (http_data_->has_local_response) break;
         g_module_manager->executeFilter(m, context_id_, "onResponseTrailers");
       }
@@ -144,7 +144,7 @@ public:
   void onDone() {
     LOG_INFO("[Filter] Stream processing complete (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onDone");
       }
     }
@@ -154,7 +154,7 @@ public:
   void onRequestMetadata() {
     LOG_INFO("[Filter] onRequestMetadata called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onRequestMetadata");
       }
     }
@@ -163,7 +163,7 @@ public:
   void onResponseMetadata() {
     LOG_INFO("[Filter] onResponseMetadata called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onResponseMetadata");
       }
     }
@@ -173,7 +173,7 @@ public:
   void onNewConnection() {
     LOG_INFO("[Filter] New connection (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onNewConnection");
       }
     }
@@ -182,7 +182,7 @@ public:
   void onDownstreamConnectionClose() {
     LOG_INFO("[Filter] Downstream connection closed (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onDownstreamConnectionClose");
       }
     }
@@ -191,7 +191,7 @@ public:
   void onUpstreamConnectionClose() {
     LOG_INFO("[Filter] Upstream connection closed (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onUpstreamConnectionClose");
       }
     }
@@ -201,7 +201,7 @@ public:
   void onDownstreamData() {
     LOG_INFO("[Filter] Downstream data (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onDownstreamData");
       }
     }
@@ -210,7 +210,7 @@ public:
   void onUpstreamData() {
     LOG_INFO("[Filter] Upstream data (context_id: " << context_id_ << ")");
     if (g_module_manager) {
-      for (auto &m : g_module_manager->getLoadedModules()) {
+      for (const std::string &m : g_module_manager->getLoadedModules()) {
         g_module_manager->executeFilter(m, context_id_, "onUpstreamData");
       }
     }
