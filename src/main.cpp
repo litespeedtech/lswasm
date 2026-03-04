@@ -1,4 +1,5 @@
 #include <iostream>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 
 // HTTP Server Configuration
 const int DEFAULT_PORT = 8080;
+const char *DEFAULT_UDS_PATH = "/tmp/lshttpd/lswasm.sock";
 const int BACKLOG = 5;
 const int BUFFER_SIZE = 4096;
 const int MAX_EPOLL_EVENTS = 64;
@@ -257,6 +259,19 @@ private:
             return false;
         }
 
+        // Ensure the parent directory exists (e.g. /tmp/lshttpd/).
+        auto parent = std::filesystem::path(uds_path_).parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                LOG_ERROR("Failed to create parent directory for UDS socket "
+                          << parent << ": " << ec.message());
+                close(server_socket_);
+                return false;
+            }
+        }
+
         // Remove any stale socket file.
         ::unlink(uds_path_.c_str());
 
@@ -400,6 +415,9 @@ private:
 
         // Parse headers (simplified)
         std::string line;
+        // Consume the remainder of the request line (trailing \r\n after
+        // the version token) so the header loop starts at the first header.
+        std::getline(iss, line);
         while (std::getline(iss, line) && !line.empty() && line != "\r") {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
@@ -543,15 +561,17 @@ void signal_handler(int sig) {
 int main(int argc, char* argv[]) {
     int port = DEFAULT_PORT;
     std::string wasm_module_path;
-    std::string uds_path;
+    std::string uds_path = DEFAULT_UDS_PATH;
     std::unordered_map<std::string, std::string> wasm_envs;
     bool debug = false;
+    bool port_specified = false;
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
             port = std::stoi(argv[++i]);
+            port_specified = true;
         } else if (arg == "--uds" && i + 1 < argc) {
             uds_path = argv[++i];
         } else if (arg == "--module" && i + 1 < argc) {
@@ -574,13 +594,14 @@ int main(int argc, char* argv[]) {
             std::cout << "WASM HTTP Proxy Server with Proxy-WASM Support\n";
             std::cout << "Usage: " << argv[0] << " [options]\n";
             std::cout << "Options:\n";
-            std::cout << "  --port PORT      : Listen on TCP port (default: " << DEFAULT_PORT << ")\n";
-            std::cout << "  --uds PATH       : Listen on Unix domain socket at PATH\n";
+            std::cout << "  --port PORT      : Listen on TCP port (instead of UDS)\n";
+            std::cout << "  --uds PATH       : Listen on Unix domain socket (default: " << DEFAULT_UDS_PATH << ")\n";
             std::cout << "  --module PATH    : Load WASM filter module\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
             std::cout << "  --debug          : Enable debug logging to " << lswasm_log::LOG_PATH << "\n";
             std::cout << "  --help           : Show this help message\n";
-            std::cout << "\nWhen both --port and --uds are given, only --uds is used.\n";
+            std::cout << "\nBy default, listens on UDS at " << DEFAULT_UDS_PATH << ".\n";
+            std::cout << "Use --port to listen on TCP instead. When both --port and --uds are given, only --uds is used.\n";
             return 0;
         }
     }
@@ -631,11 +652,16 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        // Create server: prefer UDS if specified, otherwise TCP.
+        // Create server: default to UDS; use TCP only if --port was explicitly
+        // given without a custom --uds override.
         std::unique_ptr<HttpServer> server;
-        if (!uds_path.empty()) {
+        bool explicit_uds = (uds_path != DEFAULT_UDS_PATH);
+        if (explicit_uds || !port_specified) {
+            // Use UDS: either explicit --uds was given (always wins) or no
+            // --port was specified (fall through to the default UDS path).
             server = std::make_unique<HttpServer>(HttpServer::uds(uds_path));
         } else {
+            // --port given without an explicit --uds override: use TCP.
             server = std::make_unique<HttpServer>(HttpServer::tcp(port));
         }
 

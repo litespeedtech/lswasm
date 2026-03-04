@@ -1,5 +1,6 @@
-# Build directory
+# Build directories
 build/
+build-v8/
 cmake-build-debug/
 cmake-build-release/
 
@@ -15,6 +16,10 @@ lswasm
 *.a
 *.o
 *.so
+samples/*.wasm
+
+# Sample build directories
+samples/build*/
 
 # CMake
 CMakeLists.txt.user
@@ -23,6 +28,7 @@ CMakeUserPresets.json
 **/CMakeFiles/
 **/cmake_install.cmake
 samples/Makefile
+Makefile
 
 # Third-party source downloads
 third_party/wasmtime-src/

@@ -66,6 +66,11 @@ public:
     LOG_INFO("[Filter] onRequestHeaders called (context_id: " << context_id_ << ")");
     if (g_module_manager) {
       for (auto &m : g_module_manager->getLoadedModules()) {
+        // Ensure the stream context exists *before* setting headers.
+        // executeFilter() used to lazily create the context, which meant
+        // setContextHeaders() found no stream_context and silently dropped
+        // the headers.
+        g_module_manager->ensureStreamContext(m, context_id_);
         // Push request headers into the WASM context before execution.
         g_module_manager->setContextHeaders(
             m, proxy_wasm::WasmHeaderMapType::RequestHeaders, http_data_->request_headers);

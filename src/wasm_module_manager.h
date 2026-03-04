@@ -73,6 +73,125 @@ class LsWasmContext : public proxy_wasm::ContextBase {
 public:
   using proxy_wasm::ContextBase::ContextBase;
 
+  // Fix up the parent context for stream (non-root) contexts.
+  // The factory method LsWasm::createContext() uses the root context
+  // constructor (WasmBase*, PluginBase) which sets parent_context_ = this
+  // (self-referencing).  Before calling onCreate(), the caller must call
+  // this method so that proxy_on_context_create receives the *root*
+  // context id rather than the stream context's own id.
+  void setParentContext(proxy_wasm::ContextBase *parent) {
+    parent_context_ = parent;
+    parent_context_id_ = parent ? parent->id() : 0;
+  }
+
+  // Override error() to log via LOG_ERROR instead of the base-class behaviour
+  // (std::cerr + abort), which makes unimplemented-but-non-critical API calls
+  // survivable rather than immediately fatal.
+  void error(std::string_view message) override {
+    LOG_ERROR("[WASM Context Error] " << message);
+  }
+
+  // Override unimplemented() so that missing API methods log and return
+  // WasmResult::Unimplemented instead of aborting.
+  proxy_wasm::WasmResult unimplemented() override {
+    LOG_ERROR("[WASM] unimplemented proxy-wasm API called");
+    return proxy_wasm::WasmResult::Unimplemented;
+  }
+
+  // ---- ABI 0.1.0 compatibility: getConfiguration / getStatus ----
+  // In ABI 0.1.0, modules call proxy_get_configuration during
+  // proxy_on_vm_start (to get vm_configuration) and proxy_on_configure
+  // (to get plugin_configuration).  The base class defaults to
+  // unimplemented(), which logs an error and returns "".
+  //
+  // The ContextBase stores the current plugin in temp_plugin_ during
+  // onConfigure, and the vm_configuration lives on the WasmBase.
+  // We return whichever is appropriate.
+  std::string_view getConfiguration() override {
+    // During onConfigure, plugin_ or temp_plugin_ holds the plugin
+    // whose configuration the module is asking for.
+    if (plugin_) {
+      return plugin_->plugin_configuration_;
+    }
+    // During onStart (proxy_on_vm_start), plugin_ may not be set yet;
+    // return the VM-level configuration instead.
+    if (wasm()) {
+      return wasm()->vm_configuration();
+    }
+    return "";
+  }
+
+  std::pair<uint32_t, std::string_view> getStatus() override {
+    // Return OK status; lswasm does not have a concept of status codes
+    // outside of HTTP responses.
+    return std::make_pair(0, "");
+  }
+
+  // ---- continueStream / clearRouteCache ----
+  // These are called when the filter wants to resume processing after
+  // pausing the stream (e.g. after an async call) or to clear the
+  // routing cache.  For lswasm's simple single-request model they are
+  // no-ops.
+  proxy_wasm::WasmResult continueStream(proxy_wasm::WasmStreamType /* stream_type */) override {
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  void clearRouteCache() override {
+    // No-op: lswasm does not maintain a route cache.
+  }
+
+  // ---- Buffer access (proxy_get_buffer_bytes / proxy_set_buffer_bytes) ----
+  // Modules call proxy_get_buffer_bytes to read the plugin configuration
+  // (ABI 0.2.x) or HTTP body (all ABIs).  Return a BufferBase pointing
+  // at the relevant data when we have it, nullptr otherwise.
+  proxy_wasm::BufferInterface *getBuffer(proxy_wasm::WasmBufferType type) override {
+    switch (type) {
+      case proxy_wasm::WasmBufferType::PluginConfiguration:
+        if (plugin_) {
+          buffer_.set(plugin_->plugin_configuration_);
+          return &buffer_;
+        }
+        if (temp_plugin_) {
+          buffer_.set(temp_plugin_->plugin_configuration_);
+          return &buffer_;
+        }
+        return nullptr;
+      case proxy_wasm::WasmBufferType::VmConfiguration:
+        if (wasm()) {
+          buffer_.set(wasm()->vm_configuration());
+          return &buffer_;
+        }
+        return nullptr;
+      default:
+        LOG_INFO("[WASM] getBuffer: unsupported buffer type "
+                 << static_cast<int>(type));
+        return nullptr;
+    }
+  }
+
+  bool endOfStream(proxy_wasm::WasmStreamType /* type */) override {
+    // For the simple request model, always report end of stream.
+    return true;
+  }
+
+  // Property accessor — the proxy-wasm-cpp-SDK calls proxy_get_property
+  // during proxy_on_context_create to obtain "plugin_root_id", which is
+  // used to look up the registered RootContext factory.  Without this
+  // override the base class aborts with "unimplemented proxy-wasm API".
+  proxy_wasm::WasmResult getProperty(std::string_view path,
+                                     std::string *result) override {
+    if (!result) {
+      return proxy_wasm::WasmResult::BadArgument;
+    }
+    if (path == "plugin_root_id") {
+      *result = std::string(root_id());
+      return proxy_wasm::WasmResult::Ok;
+    }
+    // For any other property, return NotFound instead of aborting.
+    LOG_INFO("[WASM] getProperty: unknown path '" << std::string(path) << "'");
+    return proxy_wasm::WasmResult::NotFound;
+  }
+
   // Capture log messages from the WASM module.
   proxy_wasm::WasmResult log(uint32_t level, std::string_view message) override {
     LOG_INFO("[WASM log L" << level << "] " << message);
@@ -247,6 +366,10 @@ private:
 
   // Per-request header maps keyed by WasmHeaderMapType.  Stored as owned strings.
   std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs> header_maps_;
+
+  // Scratch buffer for getBuffer() — points into owned data elsewhere
+  // (plugin_configuration_, vm_configuration, etc.).
+  proxy_wasm::BufferBase buffer_;
 };
 
 /**
@@ -320,6 +443,14 @@ public:
    * @param phase Filter phase (onRequestHeaders, onResponseHeaders, etc.)
    * @return true if execution successful
    */
+  /**
+   * Ensure a stream context exists for the given module and context_id.
+   * Creates one (via proxy_on_context_create) if it doesn't already exist.
+   * Must be called before setContextHeaders() so headers can be populated
+   * before the filter phase executes.
+   */
+  bool ensureStreamContext(const std::string &module_name, uint32_t context_id);
+
   bool executeFilter(const std::string &module_name, uint32_t context_id,
                      const std::string &phase);
 

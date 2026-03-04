@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "include/proxy-wasm/bytecode_util.h"
+
 bool WasmModuleManager::loadModule(const std::string &module_path,
                                     const std::string &module_name) {
   // Read WASM file
@@ -38,6 +40,44 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
   try {
     LOG_INFO("Loading WASM module: " << module_name << " (" << code_size << " bytes)");
 
+    // ---------------------------------------------------------------------------
+    // Pre-flight check: verify the module is a valid proxy-wasm filter.
+    // This catches the common mistake of passing a plain WASI CLI program
+    // (e.g. one compiled with _start) instead of a proxy-wasm module (which
+    // must export proxy_abi_version_0_1_0, 0_2_0, or 0_2_1).
+    // ---------------------------------------------------------------------------
+    {
+      std::string_view bytecode_view(reinterpret_cast<const char *>(code), code_size);
+      proxy_wasm::AbiVersion abi = proxy_wasm::AbiVersion::Unknown;
+
+      if (!proxy_wasm::BytecodeUtil::getAbiVersion(bytecode_view, abi)) {
+        LOG_ERROR("Failed to parse WASM bytecode for module: " << module_name
+                  << " — the file may be corrupt or not a valid WebAssembly module.");
+        return false;
+      }
+
+      if (abi == proxy_wasm::AbiVersion::Unknown) {
+        LOG_ERROR("Module '" << module_name << "' is not a proxy-wasm filter module.\n"
+                  << "    The WASM binary does not export a proxy-wasm ABI version\n"
+                  << "    (expected proxy_abi_version_0_1_0, 0_2_0, or 0_2_1).\n"
+                  << "    This usually means the module is a plain WASI CLI program\n"
+                  << "    (e.g. compiled with _start).  lswasm only supports modules\n"
+                  << "    built with the proxy-wasm ABI.\n"
+                  << "    To run a plain WASI program, use wasmtime directly:\n"
+                  << "      wasmtime run <module.wasm>");
+        return false;
+      }
+
+      const char *abi_str = "unknown";
+      switch (abi) {
+        case proxy_wasm::AbiVersion::ProxyWasm_0_1_0: abi_str = "0.1.0"; break;
+        case proxy_wasm::AbiVersion::ProxyWasm_0_2_0: abi_str = "0.2.0"; break;
+        case proxy_wasm::AbiVersion::ProxyWasm_0_2_1: abi_str = "0.2.1"; break;
+        default: break;
+      }
+      LOG_INFO("Detected proxy-wasm ABI version " << abi_str << " for module: " << module_name);
+    }
+
     // Create a VM instance for the configured runtime.
 #if defined(WASM_RUNTIME_WASMTIME)
     auto vm = proxy_wasm::createWasmtimeVm();
@@ -69,11 +109,21 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     }
 
     // Create a plugin for this module.
+    // NOTE: root_id must match the root_id used in the SDK's RegisterContextFactory.
+    // The proxy-wasm-cpp-sdk default is "" (empty string).  If the WASM module
+    // registers its factories with a specific root_id, this should be made
+    // configurable.  Using "" here matches the common SDK default.
     auto plugin = std::make_shared<proxy_wasm::PluginBase>(
         /*name=*/module_name,
-        /*root_id=*/module_name,
+        /*root_id=*/"",
         /*vm_id=*/module_name,
+#if defined(WASM_RUNTIME_WASMTIME)
         /*engine=*/"wasmtime",
+#elif defined(WASM_RUNTIME_V8)
+        /*engine=*/"v8",
+#else
+        /*engine=*/"",
+#endif
         /*plugin_configuration=*/"",
         /*fail_open=*/false,
         /*key=*/module_name);
@@ -105,6 +155,64 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
   }
 }
 
+bool WasmModuleManager::ensureStreamContext(const std::string &module_name, uint32_t context_id) {
+  auto it = modules_.find(module_name);
+  if (it == modules_.end()) {
+    LOG_ERROR("Module not found: " << module_name);
+    return false;
+  }
+
+  auto &state = it->second;
+  auto &wasm = state.wasm;
+
+  if (!wasm || wasm->isFailed()) {
+    LOG_ERROR("Module VM not available or failed: " << module_name);
+    return false;
+  }
+
+  // Already have a stream context for this context_id — nothing to do.
+  if (state.stream_context && state.stream_context_id == context_id) {
+    return true;
+  }
+
+  // Get the root context for this plugin.
+  auto *root_ctx = wasm->getRootContext(state.plugin, false);
+  if (!root_ctx) {
+    LOG_ERROR("No root context for module: " << module_name);
+    return false;
+  }
+
+  // Create a stream context via proxy_on_context_create.
+  // NOTE: LsWasm::createContext() uses the ContextBase(WasmBase*, PluginBase)
+  // constructor which makes the new context look like a root context
+  // (parent_context_ == this).  We must patch the parent to the real
+  // root context BEFORE calling onCreate(), so that
+  // proxy_on_context_create(stream_id, root_id) passes the correct
+  // root_context_id to the in-VM SDK.
+  auto *ctx = wasm->createContext(state.plugin);
+  if (!ctx) {
+    LOG_ERROR("Failed to create stream context for module: " << module_name);
+    return false;
+  }
+
+  auto *lswasm_ctx = dynamic_cast<lswasm::LsWasmContext *>(ctx);
+  if (lswasm_ctx) {
+    lswasm_ctx->setParentContext(root_ctx);
+  }
+
+  ctx->onCreate();
+
+  state.stream_context = dynamic_cast<lswasm::LsWasmContext *>(ctx);
+  state.stream_context_id = context_id;
+
+  if (state.stream_context) {
+    state.stream_context->resetLocalResponse();
+    state.stream_context->resetHeaderMaps();
+  }
+
+  return true;
+}
+
 bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t context_id,
                                        const std::string &phase) {
   auto it = modules_.find(module_name);
@@ -125,34 +233,12 @@ bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t c
             << " (context_id: " << context_id << ")");
 
   try {
-    // For onRequestHeaders, we need to create a stream context and call the filter.
+    // Ensure the stream context exists for this request.
+    if (!ensureStreamContext(module_name, context_id)) {
+      return false;
+    }
+
     if (phase == "onRequestHeaders") {
-      // Create a new stream context for this request if needed.
-      if (!state.stream_context || state.stream_context_id != context_id) {
-        // Get the root context for this plugin.
-        auto *root_ctx = wasm->getRootContext(state.plugin, false);
-        if (!root_ctx) {
-          LOG_ERROR("No root context for module: " << module_name);
-          return false;
-        }
-
-        // Create a stream context via proxy_on_context_create.
-        auto *ctx = wasm->createContext(state.plugin);
-        if (!ctx) {
-          LOG_ERROR("Failed to create stream context for module: " << module_name);
-          return false;
-        }
-        ctx->onCreate();
-
-        state.stream_context = dynamic_cast<lswasm::LsWasmContext *>(ctx);
-        state.stream_context_id = context_id;
-
-        if (state.stream_context) {
-          state.stream_context->resetLocalResponse();
-          state.stream_context->resetHeaderMaps();
-        }
-      }
-
       if (state.stream_context) {
         state.stream_context->onRequestHeaders(0, true);
       }
