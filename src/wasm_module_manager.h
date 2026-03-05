@@ -1,3 +1,21 @@
+/*****************************************************************************
+*    Open LiteSpeed is an open source HTTP server.                           *
+*    Copyright (C) 2026  LiteSpeed Technologies, Inc.                        *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation, either version 3 of the License, or       *
+*    (at your option) any later version.                                     *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful,         *
+*    but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the            *
+*    GNU General Public License for more details.                            *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see http://www.gnu.org/licenses/.      *
+*****************************************************************************/
+
 #pragma once
 
 #include <string>
@@ -64,6 +82,9 @@ public:
   }
 };
 
+// Forward declaration — full definition follows after MetricStore.
+class LsWasm;
+
 /**
  * LsWasmContext - Custom ContextBase for lswasm.
  * Captures proxy_log output and sendLocalResponse data so the host can
@@ -127,12 +148,16 @@ public:
     return std::make_pair(0, "");
   }
 
-  // ---- continueStream / clearRouteCache ----
+  // ---- continueStream / closeStream / clearRouteCache ----
   // These are called when the filter wants to resume processing after
-  // pausing the stream (e.g. after an async call) or to clear the
-  // routing cache.  For lswasm's simple single-request model they are
-  // no-ops.
+  // pausing the stream (e.g. after an async call), close the stream, or
+  // clear the routing cache.  For lswasm's simple single-request model
+  // they are all no-ops.
   proxy_wasm::WasmResult continueStream(proxy_wasm::WasmStreamType /* stream_type */) override {
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  proxy_wasm::WasmResult closeStream(proxy_wasm::WasmStreamType /* stream_type */) override {
     return proxy_wasm::WasmResult::Ok;
   }
 
@@ -190,6 +215,38 @@ public:
     // For any other property, return NotFound instead of aborting.
     LOG_INFO("[WASM] getProperty: unknown path '" << std::string(path) << "'");
     return proxy_wasm::WasmResult::NotFound;
+  }
+
+  proxy_wasm::WasmResult setProperty(std::string_view key,
+                                     std::string_view /* serialized_value */) override {
+    LOG_INFO("[WASM] setProperty: '" << std::string(key) << "' (ignored)");
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  // ---- Metrics ----
+  // Delegates to the LsWasm metric store so values are shared across all
+  // contexts within a module.  Implemented out-of-line after LsWasm is
+  // defined (see below).
+  proxy_wasm::WasmResult defineMetric(uint32_t type, std::string_view name,
+                                      uint32_t *metric_id_ptr) override;
+  proxy_wasm::WasmResult incrementMetric(uint32_t metric_id,
+                                         int64_t offset) override;
+  proxy_wasm::WasmResult recordMetric(uint32_t metric_id,
+                                      uint64_t value) override;
+  proxy_wasm::WasmResult getMetric(uint32_t metric_id,
+                                   uint64_t *value_ptr) override;
+
+  // ---- HTTP call stub ----
+  // Some filters attempt outbound HTTP calls.  Return Unimplemented
+  // gracefully (no abort).
+  proxy_wasm::WasmResult httpCall(std::string_view target,
+                                  const proxy_wasm::Pairs & /* request_headers */,
+                                  std::string_view /* request_body */,
+                                  const proxy_wasm::Pairs & /* request_trailers */,
+                                  int /* timeout_milliseconds */,
+                                  uint32_t * /* token_ptr */) override {
+    LOG_INFO("[WASM] httpCall to '" << std::string(target) << "' (not supported)");
+    return proxy_wasm::WasmResult::Unimplemented;
   }
 
   // Capture log messages from the WASM module.
@@ -357,6 +414,9 @@ public:
   }
 
 private:
+  // Helper: downcast wasm() to LsWasm* (defined out-of-line after LsWasm).
+  inline LsWasm *lswasm();
+
   std::string log_;
   bool has_local_response_ = false;
   uint32_t local_response_code_ = 0;
@@ -376,6 +436,143 @@ private:
  * LsWasm - Custom WasmBase for lswasm.
  * Overrides context creation to use LsWasmContext.
  */
+/**
+ * MetricStore - In-memory metric storage for a WASM module.
+ *
+ * Metrics are identified by a uint32_t ID whose low 2 bits encode the
+ * MetricType (Counter=0, Gauge=1, Histogram=2), matching the convention
+ * used by WasmBase in the proxy-wasm-cpp-host.
+ *
+ * Counter:   monotonically increasing via incrementMetric (offset added).
+ * Gauge:     point-in-time value via recordMetric (value replaced).
+ * Histogram: simplified — each recordMetric accumulates into a sum.
+ */
+class MetricStore {
+public:
+  // MetricType values (from proxy_wasm_enums.h):
+  //   Counter   = 0
+  //   Gauge     = 1
+  //   Histogram = 2
+  static constexpr uint32_t kTypeMask = 0x3;
+  static constexpr uint32_t kIdIncrement = 0x4;
+
+  struct MetricEntry {
+    std::string name;
+    uint32_t type;       // proxy_wasm::MetricType cast to uint32_t
+    int64_t  value = 0;  // signed to support negative gauge deltas
+  };
+
+  /**
+   * Define (or look up) a metric.
+   * If a metric with the same name and type already exists, the existing
+   * ID is returned (idempotent).
+   */
+  proxy_wasm::WasmResult define(uint32_t type, std::string_view name, uint32_t *id_out) {
+    // Check for an existing metric with the same name.
+    for (const auto &[id, entry] : metrics_) {
+      if (entry.name == name) {
+        if (entry.type != type) {
+          LOG_ERROR("[Metrics] redefining '" << name << "' with different type");
+          return proxy_wasm::WasmResult::BadArgument;
+        }
+        if (id_out) *id_out = id;
+        return proxy_wasm::WasmResult::Ok;
+      }
+    }
+
+    // Allocate a new ID — low bits encode the type.
+    uint32_t &next = nextIdForType(type);
+    uint32_t id = next;
+    next += kIdIncrement;
+
+    MetricEntry entry;
+    entry.name = std::string(name);
+    entry.type = type;
+    entry.value = 0;
+    metrics_[id] = std::move(entry);
+
+    LOG_INFO("[Metrics] defined " << metricTypeName(type)
+             << " '" << name << "' → id " << id);
+
+    if (id_out) *id_out = id;
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /**
+   * Increment a Counter (or Gauge) by the given offset.
+   */
+  proxy_wasm::WasmResult increment(uint32_t id, int64_t offset) {
+    auto it = metrics_.find(id);
+    if (it == metrics_.end()) {
+      return proxy_wasm::WasmResult::NotFound;
+    }
+    it->second.value += offset;
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /**
+   * Record a metric value.
+   * Counter:   value is added (same as increment with a positive offset).
+   * Gauge:     value replaces the current reading.
+   * Histogram: value is added to a running sum (simplified).
+   */
+  proxy_wasm::WasmResult record(uint32_t id, uint64_t value) {
+    auto it = metrics_.find(id);
+    if (it == metrics_.end()) {
+      return proxy_wasm::WasmResult::NotFound;
+    }
+    uint32_t type = it->second.type;
+    if (type == 1) {  // Gauge
+      it->second.value = static_cast<int64_t>(value);
+    } else {
+      // Counter or Histogram: accumulate.
+      it->second.value += static_cast<int64_t>(value);
+    }
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /**
+   * Read the current metric value.
+   */
+  proxy_wasm::WasmResult get(uint32_t id, uint64_t *value_out) const {
+    auto it = metrics_.find(id);
+    if (it == metrics_.end()) {
+      return proxy_wasm::WasmResult::NotFound;
+    }
+    if (value_out) {
+      *value_out = static_cast<uint64_t>(it->second.value);
+    }
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /** Retrieve all metrics (for diagnostics / HTTP endpoint). */
+  const std::map<uint32_t, MetricEntry> &all() const { return metrics_; }
+
+private:
+  uint32_t &nextIdForType(uint32_t type) {
+    switch (type) {
+      case 0:  return next_counter_id_;
+      case 1:  return next_gauge_id_;
+      case 2:  return next_histogram_id_;
+      default: return next_counter_id_;  // fallback
+    }
+  }
+
+  static const char *metricTypeName(uint32_t type) {
+    switch (type) {
+      case 0:  return "Counter";
+      case 1:  return "Gauge";
+      case 2:  return "Histogram";
+      default: return "Unknown";
+    }
+  }
+
+  std::map<uint32_t, MetricEntry> metrics_;
+  uint32_t next_counter_id_   = 0;  // Counter   type = 0
+  uint32_t next_gauge_id_     = 1;  // Gauge     type = 1
+  uint32_t next_histogram_id_ = 2;  // Histogram type = 2
+};
+
 class LsWasm : public proxy_wasm::WasmBase {
 public:
   LsWasm(std::unique_ptr<proxy_wasm::WasmVm> wasm_vm,
@@ -396,7 +593,45 @@ public:
       const std::shared_ptr<proxy_wasm::PluginBase> &plugin) override {
     return new LsWasmContext(this, plugin);
   }
+
+  /** Per-module metric store shared by all contexts. */
+  MetricStore &metrics() { return metrics_; }
+  const MetricStore &metrics() const { return metrics_; }
+
+private:
+  MetricStore metrics_;
 };
+
+// ---- Out-of-line LsWasmContext metric methods (need LsWasm definition) ----
+
+inline LsWasm *LsWasmContext::lswasm() {
+  return dynamic_cast<LsWasm *>(wasm());
+}
+
+inline proxy_wasm::WasmResult LsWasmContext::defineMetric(uint32_t type, std::string_view name,
+                                                          uint32_t *metric_id_ptr) {
+  LsWasm *lw = lswasm();
+  if (!lw) return proxy_wasm::WasmResult::InternalFailure;
+  return lw->metrics().define(type, name, metric_id_ptr);
+}
+
+inline proxy_wasm::WasmResult LsWasmContext::incrementMetric(uint32_t metric_id, int64_t offset) {
+  LsWasm *lw = lswasm();
+  if (!lw) return proxy_wasm::WasmResult::InternalFailure;
+  return lw->metrics().increment(metric_id, offset);
+}
+
+inline proxy_wasm::WasmResult LsWasmContext::recordMetric(uint32_t metric_id, uint64_t value) {
+  LsWasm *lw = lswasm();
+  if (!lw) return proxy_wasm::WasmResult::InternalFailure;
+  return lw->metrics().record(metric_id, value);
+}
+
+inline proxy_wasm::WasmResult LsWasmContext::getMetric(uint32_t metric_id, uint64_t *value_ptr) {
+  LsWasm *lw = lswasm();
+  if (!lw) return proxy_wasm::WasmResult::InternalFailure;
+  return lw->metrics().get(metric_id, value_ptr);
+}
 
 } // namespace lswasm
 

@@ -17,6 +17,7 @@ lswasm
 *.o
 *.so
 samples/*.wasm
+snapshot_blob.bin
 
 # Sample build directories
 samples/build*/

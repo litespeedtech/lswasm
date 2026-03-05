@@ -1,3 +1,21 @@
+/*****************************************************************************
+*    Open LiteSpeed is an open source HTTP server.                           *
+*    Copyright (C) 2026  LiteSpeed Technologies, Inc.                        *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation, either version 3 of the License, or       *
+*    (at your option) any later version.                                     *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful,         *
+*    but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the            *
+*    GNU General Public License for more details.                            *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see http://www.gnu.org/licenses/.      *
+*****************************************************************************/
+
 #include <iostream>
 #include <filesystem>
 #include <memory>
@@ -29,7 +47,7 @@
 
 // HTTP Server Configuration
 const int DEFAULT_PORT = 8080;
-const char *DEFAULT_UDS_PATH = "/tmp/lshttpd/lswasm.sock";
+const char *DEFAULT_UDS_PATH = "/tmp/lswasm.sock";
 const int BACKLOG = 5;
 const int BUFFER_SIZE = 4096;
 const int MAX_EPOLL_EVENTS = 64;
@@ -54,10 +72,11 @@ public:
     }
 
     // Construct a Unix Domain Socket listener at the given path.
-    static HttpServer uds(const std::string &path) {
+    static HttpServer uds(const std::string &path, mode_t sock_perm = 0666) {
         HttpServer s;
         s.mode_ = Mode::UDS;
         s.uds_path_ = path;
+        s.sock_perm_ = sock_perm;
         return s;
     }
 
@@ -205,7 +224,7 @@ public:
 private:
     enum class Mode { TCP, UDS };
 
-    HttpServer() : mode_(Mode::TCP), port_(DEFAULT_PORT), server_socket_(-1) {}
+    HttpServer() : mode_(Mode::TCP), port_(DEFAULT_PORT), sock_perm_(0666), server_socket_(-1) {}
 
     // ── Helper: set a socket to non-blocking mode ───────────────────────
 
@@ -300,8 +319,8 @@ private:
             return false;
         }
 
-        // Restrict socket access to the owner only (rw-------).
-        if (chmod(uds_path_.c_str(), 0600) != 0) {
+        // Set socket file permissions (configurable via --sock-perm, default 0666).
+        if (chmod(uds_path_.c_str(), sock_perm_) != 0) {
             LOG_ERROR("Failed to set permissions on Unix domain socket: "
                       << strerror(errno));
             close(server_socket_);
@@ -548,6 +567,7 @@ private:
     Mode mode_;
     int port_;
     std::string uds_path_;
+    mode_t sock_perm_;
     int server_socket_;
 };
 
@@ -566,6 +586,7 @@ int main(int argc, char* argv[]) {
     int port = DEFAULT_PORT;
     std::string wasm_module_path;
     std::string uds_path = DEFAULT_UDS_PATH;
+    mode_t sock_perm = 0666;
     std::unordered_map<std::string, std::string> wasm_envs;
     bool debug = false;
     bool port_specified = false;
@@ -578,6 +599,15 @@ int main(int argc, char* argv[]) {
             port_specified = true;
         } else if (arg == "--uds" && i + 1 < argc) {
             uds_path = argv[++i];
+        } else if (arg == "--sock-perm" && i + 1 < argc) {
+            const char *val = argv[++i];
+            char *endptr = nullptr;
+            unsigned long parsed = std::strtoul(val, &endptr, 8);
+            if (endptr == val || *endptr != '\0' || parsed > 0777) {
+                LOG_ERROR("Invalid --sock-perm value (expected octal 0-0777): " << val);
+                return 1;
+            }
+            sock_perm = static_cast<mode_t>(parsed);
         } else if (arg == "--module" && i + 1 < argc) {
             wasm_module_path = argv[++i];
         } else if (arg == "--env" && i + 1 < argc) {
@@ -600,6 +630,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Options:\n";
             std::cout << "  --port PORT      : Listen on TCP port (instead of UDS)\n";
             std::cout << "  --uds PATH       : Listen on Unix domain socket (default: " << DEFAULT_UDS_PATH << ")\n";
+            std::cout << "  --sock-perm MODE : Set UDS file permissions in octal (default: 0666)\n";
             std::cout << "  --module PATH    : Load WASM filter module\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
             std::cout << "  --debug          : Enable debug logging to " << lswasm_log::LOG_PATH << "\n";
@@ -659,6 +690,7 @@ int main(int argc, char* argv[]) {
             LOG_INFO("✓ Filter module loaded successfully");
         } else {
             LOG_ERROR("✗ Failed to load filter module");
+            return 1;
         }
     }
 
@@ -670,7 +702,7 @@ int main(int argc, char* argv[]) {
         if (explicit_uds || !port_specified) {
             // Use UDS: either explicit --uds was given (always wins) or no
             // --port was specified (fall through to the default UDS path).
-            server = std::make_unique<HttpServer>(HttpServer::uds(uds_path));
+            server = std::make_unique<HttpServer>(HttpServer::uds(uds_path, sock_perm));
         } else {
             // --port given without an explicit --uds override: use TCP.
             server = std::make_unique<HttpServer>(HttpServer::tcp(port));

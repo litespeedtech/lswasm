@@ -81,21 +81,25 @@ cargo install --path crates/cli
 
 ##### Building V8 from source
 
-```bash
-# 1. Install depot_tools (Google's build toolchain)
-git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-export PATH="$PWD/depot_tools:$PATH"
-
-# 2. Fetch the V8 source
-mkdir v8 && cd v8
-fetch v8
-cd v8
-
-# 3. Build the wee8 WASM C-API static library
-ninja -C out/x64.release wee8
+Follow the instructions here to install depot_tools, and getting the source tree: https://v8.dev/docs/source-code
+In the v8 directory, run:
 ```
+gn gen out/wee8 --args='
+  is_debug=false 
+  v8_symbol_level=1 
+  is_component_build=false 
+  v8_enable_i18n_support=false 
+  v8_use_external_startup_data=false 
+  v8_monolithic=true 
+  target_cpu="x64" 
+'
+autoninja -C out/wee8 wee8
+```
+This is a time-consuming process.
 
-This produces `out/x64.release/obj/libwee8.a` (~120 MB, monolithic archive
+> **Note:** Adjust arguments as needed for your specific platform (e.g., `"arm64"`).
+
+This produces `out/wee8/obj/libwee8.a` (~120 MB, monolithic archive
 containing V8, ICU, zlib, and all dependencies).
 
 Refer to the [official V8 build guide](https://v8.dev/docs/build) for
@@ -348,11 +352,23 @@ Failed to bind socket to port 8080
 - [ ] Support for additional WASM runtimes (WasmEdge, WAMR, etc.)
 - [ ] TLS/HTTPS support
 - [ ] Configuration file support (YAML/JSON)
-- [ ] Metrics
+- [x] Metrics
 
 ## License
 
-[Add your license here]
+Copyright 2026 LiteSpeed Technologies, Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.  
+
+See http://www.gnu.org/licenses/.
 
 ## Contributing
 

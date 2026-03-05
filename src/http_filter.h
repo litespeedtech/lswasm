@@ -1,3 +1,21 @@
+/*****************************************************************************
+*    Open LiteSpeed is an open source HTTP server.                           *
+*    Copyright (C) 2026  LiteSpeed Technologies, Inc.                        *
+*                                                                            *
+*    This program is free software: you can redistribute it and/or modify    *
+*    it under the terms of the GNU General Public License as published by    *
+*    the Free Software Foundation, either version 3 of the License, or       *
+*    (at your option) any later version.                                     *
+*                                                                            *
+*    This program is distributed in the hope that it will be useful,         *
+*    but WITHOUT ANY WARRANTY; without even the implied warranty of          *
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the            *
+*    GNU General Public License for more details.                            *
+*                                                                            *
+*    You should have received a copy of the GNU General Public License       *
+*    along with this program. If not, see http://www.gnu.org/licenses/.      *
+*****************************************************************************/
+
 #pragma once
 
 #include <string>
@@ -64,6 +82,12 @@ public:
   //   response.
   void onRequestHeaders() {
     LOG_INFO("[Filter] onRequestHeaders called (context_id: " << context_id_ << ")");
+
+    // Proxy-wasm filters expect HTTP/2-style pseudo-headers in the request
+    // header map.  Synthesize them from the parsed HTTP/1.1 request line
+    // before passing headers to WASM modules.
+    synthesizePseudoHeaders();
+
     if (g_module_manager) {
       for (const std::string &m : g_module_manager->getLoadedModules()) {
         // Ensure the stream context exists *before* setting headers.
@@ -222,6 +246,53 @@ public:
   const HttpData *getHttpData() const { return http_data_; }
 
 private:
+  // Synthesize HTTP/2-style pseudo-headers that proxy-wasm filters expect.
+  // These are derived from the HTTP/1.1 request line (method, path, version)
+  // and the Host header.  They are prepended to the request header list so
+  // the filter sees them via proxy_get_http_request_header(":method") etc.
+  void synthesizePseudoHeaders() {
+    HeaderPairs &hdrs = http_data_->request_headers;
+
+    // Only add pseudo-headers if they are not already present.
+    auto has = [&hdrs](const char *name) -> bool {
+      for (const auto &p : hdrs) {
+        if (header_name_eq(p.first, name)) return true;
+      }
+      return false;
+    };
+
+    // Build the list of pseudo-headers to prepend (in the canonical order).
+    HeaderPairs pseudo;
+
+    if (!has(":method") && !http_data_->method.empty()) {
+      pseudo.emplace_back(":method", http_data_->method);
+    }
+    if (!has(":path") && !http_data_->path.empty()) {
+      pseudo.emplace_back(":path", http_data_->path);
+    }
+    if (!has(":scheme")) {
+      // lswasm always serves plain HTTP (no TLS termination).
+      pseudo.emplace_back(":scheme", "http");
+    }
+    if (!has(":authority")) {
+      // Derive :authority from the Host header, falling back to "localhost".
+      std::string authority = "localhost";
+      for (const auto &p : hdrs) {
+        if (header_name_eq(p.first, "Host")) {
+          authority = p.second;
+          break;
+        }
+      }
+      pseudo.emplace_back(":authority", authority);
+    }
+
+    if (!pseudo.empty()) {
+      // Prepend pseudo-headers before the real headers.
+      pseudo.insert(pseudo.end(), hdrs.begin(), hdrs.end());
+      hdrs = std::move(pseudo);
+    }
+  }
+
   void checkLocalResponse(const std::string &module_name) {
     if (g_module_manager && g_module_manager->hasLocalResponse(module_name)) {
       http_data_->has_local_response = true;
