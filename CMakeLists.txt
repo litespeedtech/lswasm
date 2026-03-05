@@ -10,8 +10,8 @@ else()
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# WASM runtime selection: "wasmtime" (default), "v8", or "" (Null VM only).
-set(WASM_RUNTIME "wasmtime" CACHE STRING "WASM runtime to use (wasmtime, v8, or empty for Null VM)")
+# WASM runtime selection: "wasmtime" (default), "v8", "wasmedge", or "" (Null VM only).
+set(WASM_RUNTIME "wasmtime" CACHE STRING "WASM runtime to use (wasmtime, v8, wasmedge, or empty for Null VM)")
 
 # Find required packages
 find_package(OpenSSL REQUIRED)
@@ -79,14 +79,14 @@ if(WASM_RUNTIME STREQUAL "wasmtime")
 #   V8_ROOT/include/v8.h
 #   V8_ROOT/src/wasm/c-api.h
 #   V8_ROOT/third_party/wasm-api/wasm.hh
-#   V8_ROOT/out/x64.release/obj/libwee8.a
+#   V8_ROOT/out/wee8/obj/libwee8.a
 elseif(WASM_RUNTIME STREQUAL "v8")
-  set(V8_ROOT "" CACHE PATH "Path to V8 source tree (with out/x64.release/obj/libwee8.a)")
+  set(V8_ROOT "" CACHE PATH "Path to V8 source tree (with out/wee8/obj/libwee8.a)")
 
   if(V8_ROOT AND IS_DIRECTORY "${V8_ROOT}")
     # --- V8 from source tree ---
-    # Determine build output directory (allow V8_BUILD_DIR override, default x64.release).
-    set(V8_BUILD_DIR "${V8_ROOT}/out/x64.release" CACHE PATH "V8 build output directory")
+    # Determine build output directory (allow V8_BUILD_DIR override, default out/wee8).
+    set(V8_BUILD_DIR "${V8_ROOT}/out/wee8" CACHE PATH "V8 build output directory")
 
     # Verify key files exist.
     if(NOT EXISTS "${V8_ROOT}/include/v8.h")
@@ -234,8 +234,51 @@ elseif(WASM_RUNTIME STREQUAL "v8")
     endif()
   endif()
 
+# ---- WasmEdge ----
+elseif(WASM_RUNTIME STREQUAL "wasmedge")
+  # Try pkg-config first (standard WasmEdge install provides wasmedge.pc).
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(WASMEDGE QUIET wasmedge)
+  endif()
+
+  if(WASMEDGE_FOUND)
+    include_directories(${WASMEDGE_INCLUDE_DIRS})
+    link_directories(${WASMEDGE_LIBRARY_DIRS})
+    list(APPEND PROXY_WASM_SOURCES
+      "${PROXY_WASM_HOST_DIR}/src/wasmedge/wasmedge.cc"
+    )
+    set(HAVE_RUNTIME TRUE)
+    message(STATUS "WasmEdge found via pkg-config and enabled")
+  else()
+    # Fallback: try find_path / find_library for manual installs.
+    find_path(WASMEDGE_INCLUDE_DIR wasmedge/wasmedge.h
+      PATHS /usr/local/include /usr/include
+            "$ENV{HOME}/.wasmedge/include"
+            "${CMAKE_SOURCE_DIR}/third_party/wasmedge/include")
+    find_library(WASMEDGE_LIBRARY wasmedge
+      PATHS /usr/local/lib /usr/lib /usr/lib64
+            "$ENV{HOME}/.wasmedge/lib"
+            "${CMAKE_SOURCE_DIR}/third_party/wasmedge/lib")
+
+    if(WASMEDGE_INCLUDE_DIR AND WASMEDGE_LIBRARY)
+      include_directories(${WASMEDGE_INCLUDE_DIR})
+      get_filename_component(WASMEDGE_LIB_DIR "${WASMEDGE_LIBRARY}" DIRECTORY)
+      link_directories(${WASMEDGE_LIB_DIR})
+      list(APPEND PROXY_WASM_SOURCES
+        "${PROXY_WASM_HOST_DIR}/src/wasmedge/wasmedge.cc"
+      )
+      set(HAVE_RUNTIME TRUE)
+      message(STATUS "WasmEdge found at ${WASMEDGE_LIBRARY}")
+    else()
+      message(FATAL_ERROR "WASM_RUNTIME=wasmedge but WasmEdge not found.\n"
+        "Install via: curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash\n"
+        "Or see: https://wasmedge.org/docs/start/install")
+    endif()
+  endif()
+
 elseif(NOT WASM_RUNTIME STREQUAL "")
-  message(FATAL_ERROR "Unknown WASM_RUNTIME value: '${WASM_RUNTIME}'. Use 'wasmtime', 'v8', or empty string.")
+  message(FATAL_ERROR "Unknown WASM_RUNTIME value: '${WASM_RUNTIME}'. Use 'wasmtime', 'v8', 'wasmedge', or empty string.")
 endif()
 
 # Add null VM support (always available)
@@ -265,7 +308,7 @@ target_link_libraries(proxy-wasm-host
   PUBLIC OpenSSL::SSL OpenSSL::Crypto
 )
 
-# Propagate the chosen runtime as a compile definition: WASM_RUNTIME_WASMTIME or WASM_RUNTIME_V8.
+# Propagate the chosen runtime as a compile definition: WASM_RUNTIME_WASMTIME, WASM_RUNTIME_V8, or WASM_RUNTIME_WASMEDGE.
 if(WASM_RUNTIME STREQUAL "wasmtime" AND HAVE_RUNTIME)
   target_link_libraries(proxy-wasm-host PUBLIC wasmtime)
   target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_WASMTIME)
@@ -335,6 +378,13 @@ elseif(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME)
     target_link_libraries(proxy-wasm-host PUBLIC v8)
   endif()
   target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_V8)
+elseif(WASM_RUNTIME STREQUAL "wasmedge" AND HAVE_RUNTIME)
+  if(WASMEDGE_FOUND)
+    target_link_libraries(proxy-wasm-host PUBLIC ${WASMEDGE_LIBRARIES})
+  else()
+    target_link_libraries(proxy-wasm-host PUBLIC "${WASMEDGE_LIBRARY}")
+  endif()
+  target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_WASMEDGE)
 endif()
 
 # Main executable - HTTP proxy server with proxy-wasm filter support
@@ -370,6 +420,9 @@ elseif(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME)
     endif()
   endif()
   target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_V8)
+elseif(WASM_RUNTIME STREQUAL "wasmedge" AND HAVE_RUNTIME)
+  # WasmEdge libraries are already propagated via proxy-wasm-host (PUBLIC linkage).
+  target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_WASMEDGE)
 endif()
 
 # V8 snapshot blob: when V8 is built with V8_USE_EXTERNAL_STARTUP_DATA (the

@@ -38,6 +38,8 @@
 #include "proxy-wasm/wasmtime.h"
 #elif defined(WASM_RUNTIME_V8)
 #include "proxy-wasm/v8.h"
+#elif defined(WASM_RUNTIME_WASMEDGE)
+#include "proxy-wasm/wasmedge.h"
 #endif
 
 // Owned header pairs type (std::string, not string_view).

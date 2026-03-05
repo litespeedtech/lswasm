@@ -106,10 +106,10 @@ $WASI_SDK/bin/clang++ --target=wasm32-wasi -O2 -std=c++17 \
 ./build/lswasm --module samples/sample_filter.wasm
 ```
 
-Then send a request:
+Then send a request (via the default Unix domain socket):
 
 ```bash
-curl http://localhost:8080/
+curl --unix-socket /tmp/lswasm.sock http://localhost/
 ```
 
 The server console will show the filter's log messages as the request is

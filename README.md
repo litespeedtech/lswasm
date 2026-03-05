@@ -1,6 +1,6 @@
 # WASM HTTP Proxy Server
 
-A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for **Wasmtime** and **V8** runtimes.
+A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for **Wasmtime**, **V8**, and **WasmEdge** runtimes.
 
 ## Features
 
@@ -9,7 +9,7 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 - WASM filter module loading and execution via proxy-wasm-cpp-host
 - HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
 - **Response header manipulation** from WASM modules via proxy-wasm ABI
-- Support for Wasmtime and V8 runtimes (selectable via `-DWASM_RUNTIME=`)
+- Support for Wasmtime, V8, and WasmEdge runtimes (selectable via `-DWASM_RUNTIME=`)
 - Per-module environment variables (`--env KEY=VALUE`)
 - Graceful shutdown with signal handling (SIGINT, SIGTERM)
 - Modular CMake-based build system
@@ -91,7 +91,8 @@ gn gen out/wee8 --args='
   v8_enable_i18n_support=false 
   v8_use_external_startup_data=false 
   v8_monolithic=true 
-  target_cpu="x64" 
+  target_cpu="x64"
+  v8_enable_sandbox=false 
 '
 autoninja -C out/wee8 wee8
 ```
@@ -129,6 +130,30 @@ automatically extracts all required `.rlib` and `.a` dependencies from V8's
 - ~55 Rust `.rlib` archives (temporal_rs, icu_calendar, diplomat_runtime, etc.)
 - Rust standard library sysroot archives
 - `libclang_rt.builtins.a`
+
+#### WasmEdge
+
+WasmEdge is a lightweight, high-performance WebAssembly runtime optimized for
+cloud-native, edge, and decentralized applications.
+
+```bash
+# Quick install (Linux/macOS)
+curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
+
+# Ubuntu/Debian — install development files
+sudo apt-get install -y wasmedge
+
+# Or build from source
+git clone https://github.com/WasmEdge/WasmEdge.git
+cd WasmEdge
+cmake -Bbuild -GNinja -DCMAKE_BUILD_TYPE=Release .
+cmake --build build
+sudo cmake --install build
+```
+
+The WasmEdge C SDK headers (`wasmedge/wasmedge.h`) and shared library
+(`libwasmedge.so`) must be installed in a standard system path or in
+`third_party/wasmedge/`.
 
 ## Building
 
@@ -174,6 +199,16 @@ cmake .. \
 cmake --build . -j$(nproc)
 ```
 
+#### With WasmEdge
+
+```bash
+cmake .. \
+  -DWASM_RUNTIME=wasmedge \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build . -j$(nproc)
+```
+
 ## Running
 
 ### Basic Usage
@@ -182,18 +217,18 @@ cmake --build . -j$(nproc)
 ./lswasm
 ```
 
-Server will listen on `http://localhost:8080`
+By default, lswasm listens on a Unix domain socket at `/tmp/lswasm.sock`.
 
-### Custom Port
+### Custom TCP Port
 
 ```bash
 ./lswasm --port 9000
 ```
 
-### Unix Domain Socket
+### Custom Unix Domain Socket Path
 
 ```bash
-./lswasm --uds /tmp/lswasm.sock
+./lswasm --uds /var/run/lswasm.sock
 ```
 
 When both `--port` and `--uds` are given, only `--uds` is used.
@@ -218,9 +253,16 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 
 ## Testing
 
-### Basic Health Check
+By default, lswasm listens on a **Unix domain socket** at `/tmp/lswasm.sock`.
+Use `--port` to switch to TCP mode for direct `curl` testing.
+
+### Basic Health Check (TCP mode)
 
 ```bash
+# Start with TCP listener:
+./lswasm --port 8080
+
+# In another terminal:
 curl http://localhost:8080/
 
 # Output:
@@ -231,7 +273,17 @@ curl http://localhost:8080/
 # Runtime: Wasmtime
 ```
 
-### With netcat
+### Via Unix Domain Socket (default mode)
+
+```bash
+# Start with the default UDS listener:
+./lswasm
+
+# In another terminal:
+curl --unix-socket /tmp/lswasm.sock http://localhost/
+```
+
+### With netcat (TCP mode)
 
 ```bash
 echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
@@ -241,9 +293,9 @@ echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
 
 The CMakeLists.txt provides the following options:
 
-- `WASM_RUNTIME` (string) - WASM runtime to use: `wasmtime` (default), `v8`, or empty string for Null VM
+- `WASM_RUNTIME` (string) - WASM runtime to use: `wasmtime` (default), `v8`, `wasmedge`, or empty string for Null VM
 - `V8_ROOT` (path) - Path to V8 source tree (required when `WASM_RUNTIME=v8`)
-- `V8_BUILD_DIR` (path) - V8 build output directory (default: `V8_ROOT/out/x64.release`)
+- `V8_BUILD_DIR` (path) - V8 build output directory (default: `V8_ROOT/out/wee8`)
 - `CMAKE_BUILD_TYPE` - Release or Debug build
 
 Build output will show the selected runtime:
@@ -340,19 +392,10 @@ Failed to bind socket to port 8080
 
 ## TODO: Future Enhancements
 
-- [x] Load and execute actual WASM modules from files
-- [x] WASM module lifecycle management (load, unload, reload)
-- [x] Response header manipulation from WASM modules — WASM filters can
-  add, replace, or remove HTTP response headers via the proxy-wasm ABI
-  (`proxy_add_header_map_value`, `proxy_replace_header_map_value`,
-  `proxy_remove_header_map_value`). Headers are synced between
-  [`HttpData`](src/http_filter.h:18) and the WASM context before/after
-  filter execution, and the response is serialized from the (potentially
-  modified) header map.
-- [ ] Support for additional WASM runtimes (WasmEdge, WAMR, etc.)
+- [x] WasmEdge runtime support
+- [ ] Support for additional WASM runtimes (WAMR, etc.)
 - [ ] TLS/HTTPS support
 - [ ] Configuration file support (YAML/JSON)
-- [x] Metrics
 
 ## License
 

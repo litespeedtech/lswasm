@@ -531,6 +531,8 @@ private:
         body += "  ✓ Wasmtime runtime available\n";
 #elif defined(WASM_RUNTIME_V8)
         body += "  ✓ V8 runtime available\n";
+#elif defined(WASM_RUNTIME_WASMEDGE)
+        body += "  ✓ WasmEdge runtime available\n";
 #else
         body += "  ℹ No WASM runtime enabled\n";
 #endif
@@ -664,6 +666,8 @@ int main(int argc, char* argv[]) {
     LOG_INFO("✓ Wasmtime runtime enabled");
 #elif defined(WASM_RUNTIME_V8)
     LOG_INFO("✓ V8 runtime enabled");
+#elif defined(WASM_RUNTIME_WASMEDGE)
+    LOG_INFO("✓ WasmEdge runtime enabled");
 #else
     LOG_INFO("ℹ No WASM runtime enabled (using Null VM)");
 #endif

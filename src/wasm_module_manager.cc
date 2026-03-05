@@ -103,8 +103,12 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     LOG_INFO("Creating V8VM");
     std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createV8Vm();
     LOG_INFO("Created V8VM");
+#elif defined(WASM_RUNTIME_WASMEDGE)
+    LOG_INFO("Creating WasmEdge VM");
+    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWasmEdgeVm();
+    LOG_INFO("Created WasmEdge VM");
 #else
-    LOG_ERROR("No WASM runtime available (build with -DWASM_RUNTIME=wasmtime or -DWASM_RUNTIME=v8)");
+    LOG_ERROR("No WASM runtime available (build with -DWASM_RUNTIME=wasmtime, -DWASM_RUNTIME=v8, or -DWASM_RUNTIME=wasmedge)");
     return false;
 #endif
 
@@ -144,6 +148,8 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
         /*engine=*/"wasmtime",
 #elif defined(WASM_RUNTIME_V8)
         /*engine=*/"v8",
+#elif defined(WASM_RUNTIME_WASMEDGE)
+        /*engine=*/"wasmedge",
 #else
         /*engine=*/"",
 #endif
