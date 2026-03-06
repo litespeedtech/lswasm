@@ -1,6 +1,8 @@
-# WASM HTTP Proxy Server
+# lswasm
 
-A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for **Wasmtime**, **V8**, and **WasmEdge** runtimes.
+**Version 1.0.0** · [Changelog](CHANGES.md)
+
+A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for **Wasmtime**, **V8**, **WasmEdge**, and **WAMR** runtimes.
 
 ## Features
 
@@ -9,7 +11,7 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 - WASM filter module loading and execution via proxy-wasm-cpp-host
 - HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
 - **Response header manipulation** from WASM modules via proxy-wasm ABI
-- Support for Wasmtime, V8, and WasmEdge runtimes (selectable via `-DWASM_RUNTIME=`)
+- Support for Wasmtime, V8, WasmEdge, and WAMR runtimes (selectable via `-DWASM_RUNTIME=`)
 - Per-module environment variables (`--env KEY=VALUE`)
 - Graceful shutdown with signal handling (SIGINT, SIGTERM)
 - Modular CMake-based build system
@@ -17,21 +19,29 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 ## Architecture
 
 ```
+lswasm/
+├── CMakeLists.txt                  # Main build configuration
+├── README.md                       # This file
+├── .gitmodules                     # Git submodule configuration
 ├── src/
-│   ├── main.cpp                # HTTP server (epoll loop, CLI, request handling)
-│   ├── http_filter.h           # HTTP filter context (filter chain lifecycle)
-│   ├── wasm_module_manager.h   # WASM module manager (load, execute, state)
-│   ├── wasm_module_manager.cc  # WASM module manager implementation
-│   ├── log.h                   # Debug logging macros (file-based, --debug flag)
-│   └── hash_shim.cc            # Hash helper shim
+│   ├── main.cpp                    # HTTP server (epoll loop, CLI, request handling)
+│   ├── http_filter.h               # HTTP filter context (filter chain lifecycle)
+│   ├── wasm_module_manager.h       # WASM module manager (load, execute, state)
+│   ├── wasm_module_manager.cc      # WASM module manager implementation
+│   ├── log.h                       # Debug logging macros (file-based, --debug flag)
+│   └── hash_shim.cc               # Hash helper shim
 ├── samples/
-│   ├── sample_filter.cpp       # Example WASM filter (C++ source)
-│   ├── sample_filter.wasm      # Pre-compiled sample filter
-│   ├── CMakeLists.txt          # Build rules for samples
-│   └── README.md               # Sample documentation
+│   ├── sample_filter.cpp           # Example WASM filter (C++ source)
+│   ├── sample_filter.wasm          # Pre-compiled sample filter
+│   ├── CMakeLists.txt              # Build rules for samples
+│   └── README.md                   # Sample documentation
+├── cmake/
+│   └── wasm32-wasi-toolchain.cmake # Toolchain file for building WASM modules
 ├── third_party/
-│   └── proxy-wasm-cpp-host/    # Git submodule
-└── CMakeLists.txt              # Build configuration
+│   ├── proxy-wasm-cpp-host/        # WASM host library (git submodule)
+│   ├── proxy-wasm-cpp-sdk/         # WASM SDK (git submodule)
+│   └── proxy-wasm-spec/            # WASM spec (git submodule)
+└── build*/                         # Build output directories (gitignored)
 ```
 
 ### Submodule Integration
@@ -155,6 +165,28 @@ The WasmEdge C SDK headers (`wasmedge/wasmedge.h`) and shared library
 (`libwasmedge.so`) must be installed in a standard system path or in
 `third_party/wasmedge/`.
 
+#### WAMR (WebAssembly Micro Runtime)
+
+```bash
+# Build from source (WAMR_BUILD_LIBC_WASI=0 is required —
+# proxy-wasm-cpp-host provides its own WASI stubs)
+git clone https://github.com/bytecodealliance/wasm-micro-runtime.git
+cd wasm-micro-runtime/product-mini/platforms/linux
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_LIBC_WASI=0
+cmake --build . -j$(nproc)
+sudo cmake --install .
+```
+
+> **Important:** WAMR must be built with `-DWAMR_BUILD_LIBC_WASI=0`.
+> proxy-wasm-cpp-host supplies its own WASI function stubs; WAMR's
+> built-in WASI implementation conflicts with them and causes
+> `_initialize` to trap with `unreachable`.
+
+The WAMR C API header (`wasm_c_api.h`) and library (`libiwasm.a`)
+must be installed in a standard system path, in `third_party/wamr/`,
+or in `third_party/wasm-micro-runtime/`.
+
 ## Building
 
 ### 1. Clone with Submodules
@@ -209,6 +241,73 @@ cmake .. \
 cmake --build . -j$(nproc)
 ```
 
+#### With WAMR
+
+```bash
+cmake .. \
+  -DWASM_RUNTIME=wamr \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build . -j$(nproc)
+```
+
+## Upgrading
+
+To upgrade an existing lswasm installation to a newer version:
+
+### 1. Check the Changelog
+
+Review [CHANGES.md](CHANGES.md) for breaking changes, new features, and
+migration notes before upgrading.
+
+### 2. Pull Latest Changes
+
+```bash
+cd lswasm
+git pull
+```
+
+### 3. Update Submodules
+
+The `proxy-wasm-cpp-host` submodule may have been updated. Always sync and
+update submodules after pulling:
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+### 4. Rebuild
+
+A clean rebuild is recommended after upgrading, especially when submodules
+or build configuration have changed:
+
+```bash
+# Remove the old build directory and start fresh
+rm -rf build
+mkdir build
+cd build
+
+# Configure (use the same options as your original build)
+cmake .. \
+  -DWASM_RUNTIME=wasmtime \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build . -j$(nproc)
+```
+
+If you prefer an in-place reconfigure instead of a full clean build:
+
+```bash
+cd build
+cmake --fresh ..
+cmake --build . -j$(nproc)
+```
+
+> **Tip:** If the WASM runtime version on your system has changed (e.g. a
+> Wasmtime or V8 upgrade), you should always do a clean rebuild to avoid
+> link errors from stale cached artefacts.
+
 ## Running
 
 ### Basic Usage
@@ -250,6 +349,23 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 ```bash
 ./lswasm --help
 ```
+
+### Command-Line Reference
+
+| Option | Argument | Description |
+|--------|----------|-------------|
+| `--port` | `PORT` | Listen on a TCP port instead of a Unix domain socket |
+| `--uds` | `PATH` | Listen on a Unix domain socket (default: `/tmp/lswasm.sock`) |
+| `--sock-perm` | `MODE` | Set UDS file permissions in octal (default: `0666`) |
+| `--module` | `PATH` | Load a WASM filter module |
+| `--env` | `KEY=VALUE` | Set an environment variable for WASM modules (repeatable) |
+| `--body-pacifier` | — | Include a diagnostic body in HTTP responses (request info, runtime, filters) |
+| `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
+| `--version` | — | Print version number and exit |
+| `--help` | — | Show usage information and exit |
+
+When both `--port` and `--uds` are given, only `--uds` is used.
+By default (no `--port`), lswasm listens on the UDS path.
 
 ## Testing
 
@@ -293,7 +409,7 @@ echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
 
 The CMakeLists.txt provides the following options:
 
-- `WASM_RUNTIME` (string) - WASM runtime to use: `wasmtime` (default), `v8`, `wasmedge`, or empty string for Null VM
+- `WASM_RUNTIME` (string) - WASM runtime to use: `wasmtime` (default), `v8`, `wasmedge`, `wamr`, or empty string for Null VM
 - `V8_ROOT` (path) - Path to V8 source tree (required when `WASM_RUNTIME=v8`)
 - `V8_BUILD_DIR` (path) - V8 build output directory (default: `V8_ROOT/out/wee8`)
 - `CMAKE_BUILD_TYPE` - Release or Debug build
@@ -305,37 +421,6 @@ Build output will show the selected runtime:
 WASM runtime: wasmtime
 Runtime found: TRUE
 =========================================
-```
-
-## Project Structure
-
-```
-lswasm/
-├── CMakeLists.txt                      # Main build configuration
-├── README.md                           # This file
-├── .gitignore                          # Git ignore rules
-├── .gitmodules                         # Git submodule configuration
-├── src/
-│   ├── main.cpp                        # HTTP server (epoll loop, CLI)
-│   ├── http_filter.h                   # HTTP filter context & chain
-│   ├── wasm_module_manager.h           # WASM module manager header
-│   ├── wasm_module_manager.cc          # WASM module manager impl
-│   ├── log.h                           # Debug logging macros
-│   └── hash_shim.cc                    # Hash helper shim
-├── samples/
-│   ├── sample_filter.cpp               # Example WASM filter source
-│   ├── sample_filter.wasm              # Pre-compiled sample filter
-│   ├── sample_filter.explore.html      # Interactive filter explorer
-│   ├── CMakeLists.txt                  # Sample build rules
-│   └── README.md                       # Sample documentation
-├── third_party/
-│   └── proxy-wasm-cpp-host/           # WASM host library (submodule)
-│       ├── include/proxy-wasm/        # Header files
-│       ├── src/                       # Implementation files
-│       └── ...
-└── build/                              # Build output directory (gitignored)
-    ├── lswasm                          # Compiled executable
-    └── compile_commands.json           # For IDE support
 ```
 
 ## Development
@@ -393,7 +478,7 @@ Failed to bind socket to port 8080
 ## TODO: Future Enhancements
 
 - [x] WasmEdge runtime support
-- [ ] Support for additional WASM runtimes (WAMR, etc.)
+- [x] WAMR runtime support
 - [ ] TLS/HTTPS support
 - [ ] Configuration file support (YAML/JSON)
 
@@ -423,3 +508,5 @@ Contributions are welcome! Please submit pull requests and issues to the project
 - [Wasmtime](https://docs.wasmtime.dev/)
 - [V8](https://v8.dev/)
 - [V8 Build Guide](https://v8.dev/docs/build)
+- [WasmEdge](https://wasmedge.org/)
+- [WAMR](https://github.com/bytecodealliance/wasm-micro-runtime)

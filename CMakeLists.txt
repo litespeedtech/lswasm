@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(lswasm LANGUAGES CXX)
+project(lswasm VERSION 1.0.0 LANGUAGES CXX)
 
 # V8 ≥ 12.x requires C++20 (uses `requires` clauses in internal headers).
 # Other runtimes work fine with C++17.
@@ -10,8 +10,8 @@ else()
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# WASM runtime selection: "wasmtime" (default), "v8", "wasmedge", or "" (Null VM only).
-set(WASM_RUNTIME "wasmtime" CACHE STRING "WASM runtime to use (wasmtime, v8, wasmedge, or empty for Null VM)")
+# WASM runtime selection: "wasmtime" (default), "v8", "wasmedge", "wamr", or "" (Null VM only).
+set(WASM_RUNTIME "wasmtime" CACHE STRING "WASM runtime to use (wasmtime, v8, wasmedge, wamr, or empty for Null VM)")
 
 # Find required packages
 find_package(OpenSSL REQUIRED)
@@ -277,8 +277,52 @@ elseif(WASM_RUNTIME STREQUAL "wasmedge")
     endif()
   endif()
 
+# ---- WAMR (WebAssembly Micro Runtime) ----
+elseif(WASM_RUNTIME STREQUAL "wamr")
+  # Try pkg-config first.
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(WAMR QUIET iwasm)
+  endif()
+
+  if(WAMR_FOUND)
+    include_directories(${WAMR_INCLUDE_DIRS})
+    link_directories(${WAMR_LIBRARY_DIRS})
+    list(APPEND PROXY_WASM_SOURCES
+      "${PROXY_WASM_HOST_DIR}/src/wamr/wamr.cc"
+    )
+    set(HAVE_RUNTIME TRUE)
+    message(STATUS "WAMR found via pkg-config and enabled")
+  else()
+    # Fallback: try find_path / find_library for manual or source-built installs.
+    find_path(WAMR_INCLUDE_DIR wasm_c_api.h
+      PATHS /usr/local/include /usr/include
+            "${CMAKE_SOURCE_DIR}/third_party/wamr/core/iwasm/include"
+            "${CMAKE_SOURCE_DIR}/third_party/wasm-micro-runtime/core/iwasm/include")
+    find_library(WAMR_LIBRARY NAMES iwasm vmlib
+      PATHS /usr/local/lib /usr/lib /usr/lib64
+            "${CMAKE_SOURCE_DIR}/third_party/wamr/build"
+            "${CMAKE_SOURCE_DIR}/third_party/wasm-micro-runtime/build"
+            "${CMAKE_SOURCE_DIR}/third_party/wasm-micro-runtime/product-mini/platforms/linux/build")
+
+    if(WAMR_INCLUDE_DIR AND WAMR_LIBRARY)
+      include_directories(${WAMR_INCLUDE_DIR})
+      get_filename_component(WAMR_LIB_DIR "${WAMR_LIBRARY}" DIRECTORY)
+      link_directories(${WAMR_LIB_DIR})
+      list(APPEND PROXY_WASM_SOURCES
+        "${PROXY_WASM_HOST_DIR}/src/wamr/wamr.cc"
+      )
+      set(HAVE_RUNTIME TRUE)
+      message(STATUS "WAMR found at ${WAMR_LIBRARY}")
+    else()
+      message(FATAL_ERROR "WASM_RUNTIME=wamr but WAMR not found.\n"
+        "Build from source: https://github.com/bytecodealliance/wasm-micro-runtime\n"
+        "  cmake -Bbuild -DWAMR_BUILD_LIB_WASI_THREADS=1 && cmake --build build")
+    endif()
+  endif()
+
 elseif(NOT WASM_RUNTIME STREQUAL "")
-  message(FATAL_ERROR "Unknown WASM_RUNTIME value: '${WASM_RUNTIME}'. Use 'wasmtime', 'v8', 'wasmedge', or empty string.")
+  message(FATAL_ERROR "Unknown WASM_RUNTIME value: '${WASM_RUNTIME}'. Use 'wasmtime', 'v8', 'wasmedge', 'wamr', or empty string.")
 endif()
 
 # Add null VM support (always available)
@@ -308,7 +352,7 @@ target_link_libraries(proxy-wasm-host
   PUBLIC OpenSSL::SSL OpenSSL::Crypto
 )
 
-# Propagate the chosen runtime as a compile definition: WASM_RUNTIME_WASMTIME, WASM_RUNTIME_V8, or WASM_RUNTIME_WASMEDGE.
+# Propagate the chosen runtime as a compile definition: WASM_RUNTIME_WASMTIME, WASM_RUNTIME_V8, WASM_RUNTIME_WASMEDGE, or WASM_RUNTIME_WAMR.
 if(WASM_RUNTIME STREQUAL "wasmtime" AND HAVE_RUNTIME)
   target_link_libraries(proxy-wasm-host PUBLIC wasmtime)
   target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_WASMTIME)
@@ -385,6 +429,13 @@ elseif(WASM_RUNTIME STREQUAL "wasmedge" AND HAVE_RUNTIME)
     target_link_libraries(proxy-wasm-host PUBLIC "${WASMEDGE_LIBRARY}")
   endif()
   target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_WASMEDGE)
+elseif(WASM_RUNTIME STREQUAL "wamr" AND HAVE_RUNTIME)
+  if(WAMR_FOUND)
+    target_link_libraries(proxy-wasm-host PUBLIC ${WAMR_LIBRARIES})
+  else()
+    target_link_libraries(proxy-wasm-host PUBLIC "${WAMR_LIBRARY}")
+  endif()
+  target_compile_definitions(proxy-wasm-host PUBLIC WASM_RUNTIME_WAMR)
 endif()
 
 # Main executable - HTTP proxy server with proxy-wasm filter support
@@ -423,7 +474,18 @@ elseif(WASM_RUNTIME STREQUAL "v8" AND HAVE_RUNTIME)
 elseif(WASM_RUNTIME STREQUAL "wasmedge" AND HAVE_RUNTIME)
   # WasmEdge libraries are already propagated via proxy-wasm-host (PUBLIC linkage).
   target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_WASMEDGE)
+elseif(WASM_RUNTIME STREQUAL "wamr" AND HAVE_RUNTIME)
+  # WAMR libraries are already propagated via proxy-wasm-host (PUBLIC linkage).
+  target_compile_definitions(lswasm PRIVATE WASM_RUNTIME_WAMR)
 endif()
+
+# Pass project version to C++ code.
+target_compile_definitions(lswasm PRIVATE
+  LSWASM_VERSION="${PROJECT_VERSION}"
+  LSWASM_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+  LSWASM_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  LSWASM_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
 
 # V8 snapshot blob: when V8 is built with V8_USE_EXTERNAL_STARTUP_DATA (the
 # default), a snapshot_blob.bin file must be present next to the executable at

@@ -45,6 +45,11 @@
 #include "http_filter.h"
 #include "wasm_module_manager.h"
 
+// Version (injected by CMake via -DLSWASM_VERSION="x.y.z")
+#ifndef LSWASM_VERSION
+#define LSWASM_VERSION "unknown"
+#endif
+
 // HTTP Server Configuration
 const int DEFAULT_PORT = 8080;
 const char *DEFAULT_UDS_PATH = "/tmp/lswasm.sock";
@@ -58,6 +63,7 @@ static volatile sig_atomic_t g_shutdown = 0;
 static int g_server_socket = -1;  // For signal handler to unblock accept()
 static std::string g_uds_path;    // For cleanup on shutdown
 static std::atomic<uint32_t> g_next_context_id{1};
+static bool g_body_pacifier = false;  // When true, include diagnostic body in responses.
 std::unique_ptr<WasmModuleManager> g_module_manager;
 
 // HTTP server supporting both TCP and Unix Domain Socket listeners.
@@ -403,7 +409,10 @@ private:
         filter_ctx.onRequestTrailers();
 
         // Generate the response body first.
-        std::string body = build_response_body(http_data);
+        std::string body;
+        if (g_body_pacifier) {
+            body = build_response_body(http_data);
+        }
 
         // Populate default response headers (without Content-Length — added after filter chain).
         http_data.response_headers.clear();
@@ -533,6 +542,8 @@ private:
         body += "  ✓ V8 runtime available\n";
 #elif defined(WASM_RUNTIME_WASMEDGE)
         body += "  ✓ WasmEdge runtime available\n";
+#elif defined(WASM_RUNTIME_WAMR)
+        body += "  ✓ WAMR runtime available\n";
 #else
         body += "  ℹ No WASM runtime enabled\n";
 #endif
@@ -624,10 +635,15 @@ int main(int argc, char* argv[]) {
                 LOG_ERROR("Invalid --env format, expected KEY=VALUE: " << env_str);
                 return 1;
             }
+        } else if (arg == "--body-pacifier") {
+            g_body_pacifier = true;
         } else if (arg == "--debug") {
             debug = true;
+        } else if (arg == "--version") {
+            std::cout << "lswasm " << LSWASM_VERSION << "\n";
+            return 0;
         } else if (arg == "--help") {
-            std::cout << "WASM HTTP Proxy Server with Proxy-WASM Support\n";
+            std::cout << "lswasm " << LSWASM_VERSION << " — WASM HTTP Proxy Server with Proxy-WASM Support\n";
             std::cout << "Usage: " << argv[0] << " [options]\n";
             std::cout << "Options:\n";
             std::cout << "  --port PORT      : Listen on TCP port (instead of UDS)\n";
@@ -635,7 +651,9 @@ int main(int argc, char* argv[]) {
             std::cout << "  --sock-perm MODE : Set UDS file permissions in octal (default: 0666)\n";
             std::cout << "  --module PATH    : Load WASM filter module\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
+            std::cout << "  --body-pacifier  : Include diagnostic body in HTTP responses\n";
             std::cout << "  --debug          : Enable debug logging to " << lswasm_log::LOG_PATH << "\n";
+            std::cout << "  --version        : Show version number\n";
             std::cout << "  --help           : Show this help message\n";
             std::cout << "\nBy default, listens on UDS at " << DEFAULT_UDS_PATH << ".\n";
             std::cout << "Use --port to listen on TCP instead. When both --port and --uds are given, only --uds is used.\n";
@@ -653,21 +671,20 @@ int main(int argc, char* argv[]) {
     v8::V8::InitializeExternalStartupData(argv[0]);
 #endif
 
-    // Set up signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    // Initialize WASM module manager
+    // Initialize WASM module manager (must happen before signal handler
+    // registration so that V8, if used, cannot overwrite our handlers).
     g_module_manager = std::make_unique<WasmModuleManager>();
 
     // Print runtime information
-    LOG_INFO("\n=== WASM HTTP Proxy Server ===");
+    LOG_INFO("\n=== lswasm " << LSWASM_VERSION << " ===");
 #if defined(WASM_RUNTIME_WASMTIME)
     LOG_INFO("✓ Wasmtime runtime enabled");
 #elif defined(WASM_RUNTIME_V8)
     LOG_INFO("✓ V8 runtime enabled");
 #elif defined(WASM_RUNTIME_WASMEDGE)
     LOG_INFO("✓ WasmEdge runtime enabled");
+#elif defined(WASM_RUNTIME_WAMR)
+    LOG_INFO("✓ WAMR runtime enabled");
 #else
     LOG_INFO("ℹ No WASM runtime enabled (using Null VM)");
 #endif
@@ -696,6 +713,19 @@ int main(int argc, char* argv[]) {
             LOG_ERROR("✗ Failed to load filter module");
             return 1;
         }
+    }
+
+    // Register signal handlers AFTER V8/runtime initialisation (V8 in
+    // particular installs its own signal handlers during engine creation,
+    // which can clobber earlier registrations).  Use sigaction() for
+    // reliable, non-resettable behaviour.
+    {
+        struct sigaction sa{};
+        sa.sa_handler = signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;  // No SA_RESTART – we want epoll_wait/accept to return EINTR.
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
     }
 
     try {
@@ -733,5 +763,13 @@ int main(int argc, char* argv[]) {
     }
 
     LOG_INFO("Server stopped");
-    return 0;
+
+    // Explicitly release the module manager before main() returns so that
+    // the WASM VM (and its engine) is torn down in a controlled order.
+    // With V8 in particular, letting the static std::unique_ptr destructor
+    // run during global destruction causes a deadlock in V8's platform
+    // threads (all threads stuck in futex_do_wait).  Using _exit() as a
+    // final backstop avoids any remaining static-destructor hangs.
+    g_module_manager.reset();
+    _exit(0);
 }
