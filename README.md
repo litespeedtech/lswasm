@@ -23,6 +23,8 @@ lswasm/
 ├── CMakeLists.txt                  # Main build configuration
 ├── README.md                       # This file
 ├── .gitmodules                     # Git submodule configuration
+├── install.sh                      # Install lswasm as a systemd user service
+├── uninstall.sh                    # Remove service and installed binary
 ├── src/
 │   ├── main.cpp                    # HTTP server (epoll loop, CLI, request handling)
 │   ├── http_filter.h               # HTTP filter context (filter chain lifecycle)
@@ -32,7 +34,6 @@ lswasm/
 │   └── hash_shim.cc               # Hash helper shim
 ├── samples/
 │   ├── sample_filter.cpp           # Example WASM filter (C++ source)
-│   ├── sample_filter.wasm          # Pre-compiled sample filter
 │   ├── CMakeLists.txt              # Build rules for samples
 │   └── README.md                   # Sample documentation
 ├── cmake/
@@ -367,6 +368,56 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 When both `--port` and `--uds` are given, only `--uds` is used.
 By default (no `--port`), lswasm listens on the UDS path.
 
+## Installing as a Service
+
+lswasm ships with `install.sh` and `uninstall.sh` scripts that set up (or
+tear down) a **systemd user service** so lswasm starts automatically when
+you log in.
+
+### Install
+
+```bash
+./install.sh \
+  --bin ./build/lswasm \
+  --install-dir /opt/lswasm \
+  -- --module /etc/lswasm/filter.wasm --uds /run/lswasm.sock --debug
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--bin <path>` | Yes | Path to the compiled lswasm binary |
+| `--install-dir <path>` | Yes | Directory where the binary will be copied |
+| `--service-name <name>` | No | systemd unit name (default: `lswasm.service`) |
+| `-- <args …>` | No | All arguments after `--` are forwarded to lswasm's `ExecStart` |
+
+If `--module` or `--uds` are not present in the forwarded arguments, the
+script prompts interactively.
+
+After a successful install:
+
+```bash
+systemctl --user status lswasm.service
+journalctl --user -u lswasm.service -f
+```
+
+### Uninstall
+
+```bash
+./uninstall.sh
+```
+
+Or with a custom service name:
+
+```bash
+./uninstall.sh --service-name my-lswasm.service
+```
+
+The uninstall script:
+1. Stops and disables the systemd user service.
+2. Removes the unit file and reloads systemd.
+3. Deletes the installed binary.
+4. Removes the install directory if it is empty.
+
 ## Testing
 
 By default, lswasm listens on a **Unix domain socket** at `/tmp/lswasm.sock`.
@@ -475,12 +526,6 @@ Failed to bind socket to port 8080
 ./lswasm --port 8000
 ```
 
-## TODO: Future Enhancements
-
-- [x] WasmEdge runtime support
-- [x] WAMR runtime support
-- [ ] TLS/HTTPS support
-- [ ] Configuration file support (YAML/JSON)
 
 ## License
 

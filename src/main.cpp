@@ -664,13 +664,6 @@ int main(int argc, char* argv[]) {
     // Initialize logging: active if /tmp/lshttpd/lswasm.dolog exists or --debug is given.
     lswasm_log::log_init(debug);
 
-#if defined(WASM_RUNTIME_V8)
-    // V8 built with V8_USE_EXTERNAL_STARTUP_DATA requires a snapshot blob
-    // (snapshot_blob.bin) at runtime.  Tell V8 to look for it in the same
-    // directory as the executable.
-    v8::V8::InitializeExternalStartupData(argv[0]);
-#endif
-
     // Initialize WASM module manager (must happen before signal handler
     // registration so that V8, if used, cannot overwrite our handlers).
     g_module_manager = std::make_unique<WasmModuleManager>();

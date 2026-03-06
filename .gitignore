@@ -17,7 +17,6 @@ lswasm
 *.o
 *.so
 samples/*.wasm
-snapshot_blob.bin
 
 # Sample build directories
 samples/build*/
@@ -36,3 +35,5 @@ third_party/wasmtime-src/
 
 # macOS
 .DS_Store
+
+plans/
