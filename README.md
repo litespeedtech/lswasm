@@ -59,29 +59,38 @@ The `proxy-wasm-cpp-host` is included as a git submodule at `third_party/proxy-w
 ```bash
 # Ubuntu/Debian
 sudo apt-get update
-sudo apt-get install -y build-essential cmake git libssl-dev pkg-config
+sudo apt-get install -y build-essential cmake git libssl-dev pkg-config cargo
 
 # macOS
-brew install cmake openssl pkg-config
+brew install cmake openssl pkg-config rust
 ```
 
 ### WASM Runtimes
 
 #### Wasmtime (Default)
 
+CMake first tries `find_package(wasmtime)` for a system-installed library.
+If that fails it looks for a source build in `third_party/wasmtime-src/`.
+
+**Option A — System install (Ubuntu/Debian):**
+
 ```bash
-# Install Wasmtime
-curl https://wasmtime.dev/install.sh -sSf | bash
-
-# Install development files
-# Ubuntu/Debian
 sudo apt-get install -y libwasmtime-dev
-
-# Or build from source
-git clone https://github.com/bytecodealliance/wasmtime.git
-cd wasmtime
-cargo install --path crates/cli
 ```
+
+**Option B — Build from source into `third_party/`:**
+
+```bash
+git clone https://github.com/bytecodealliance/wasmtime.git third_party/wasmtime-src
+cd third_party/wasmtime-src
+cargo build --release -p wasmtime-c-api
+cd ../..
+```
+
+This produces the C API headers under
+`third_party/wasmtime-src/crates/c-api/include/` and the library at
+`third_party/wasmtime-src/target/release/libwasmtime.a`, which CMake
+detects automatically.
 
 #### V8
 
@@ -147,30 +156,48 @@ automatically extracts all required `.rlib` and `.a` dependencies from V8's
 WasmEdge is a lightweight, high-performance WebAssembly runtime optimized for
 cloud-native, edge, and decentralized applications.
 
+CMake first tries pkg-config, then searches system paths, `~/.wasmedge/`,
+and `third_party/wasmedge/`.
+
+**Option A — Quick install (Linux/macOS):**
+
 ```bash
-# Quick install (Linux/macOS)
 curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
-
-# Ubuntu/Debian — install development files
-sudo apt-get install -y wasmedge
-
-# Or build from source
-git clone https://github.com/WasmEdge/WasmEdge.git
-cd WasmEdge
-cmake -Bbuild -GNinja -DCMAKE_BUILD_TYPE=Release .
-cmake --build build
-sudo cmake --install build
 ```
 
-The WasmEdge C SDK headers (`wasmedge/wasmedge.h`) and shared library
-(`libwasmedge.so`) must be installed in a standard system path or in
-`third_party/wasmedge/`.
+**Option B — System install (Ubuntu/Debian):**
+
+```bash
+sudo apt-get install -y wasmedge
+```
+
+**Option C — Build from source into `third_party/`:**
+
+```bash
+git clone https://github.com/WasmEdge/WasmEdge.git third_party/wasmedge-src
+cd third_party/wasmedge-src
+cmake -Bbuild -GNinja -DCMAKE_BUILD_TYPE=Release .
+cmake --build build
+cmake --install build --prefix ../../third_party/wasmedge
+cd ../..
+```
+
+This places headers in `third_party/wasmedge/include/` and the library
+in `third_party/wasmedge/lib/`, which CMake detects automatically.
 
 #### WAMR (WebAssembly Micro Runtime)
 
+CMake first tries pkg-config, then searches system paths and
+`third_party/wamr/` or `third_party/wasm-micro-runtime/`.
+
+> **Important:** WAMR must be built with `-DWAMR_BUILD_LIBC_WASI=0`.
+> proxy-wasm-cpp-host supplies its own WASI function stubs; WAMR's
+> built-in WASI implementation conflicts with them and causes
+> `_initialize` to trap with `unreachable`.
+
+**Option A — System install:**
+
 ```bash
-# Build from source (WAMR_BUILD_LIBC_WASI=0 is required —
-# proxy-wasm-cpp-host provides its own WASI stubs)
 git clone https://github.com/bytecodealliance/wasm-micro-runtime.git
 cd wasm-micro-runtime/product-mini/platforms/linux
 mkdir build && cd build
@@ -179,14 +206,22 @@ cmake --build . -j$(nproc)
 sudo cmake --install .
 ```
 
-> **Important:** WAMR must be built with `-DWAMR_BUILD_LIBC_WASI=0`.
-> proxy-wasm-cpp-host supplies its own WASI function stubs; WAMR's
-> built-in WASI implementation conflicts with them and causes
-> `_initialize` to trap with `unreachable`.
+**Option B — Build from source into `third_party/`:**
 
-The WAMR C API header (`wasm_c_api.h`) and library (`libiwasm.a`)
-must be installed in a standard system path, in `third_party/wamr/`,
-or in `third_party/wasm-micro-runtime/`.
+```bash
+git clone https://github.com/bytecodealliance/wasm-micro-runtime.git \
+  third_party/wasm-micro-runtime
+cd third_party/wasm-micro-runtime/product-mini/platforms/linux
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_LIBC_WASI=0
+cmake --build . -j$(nproc)
+cd ../../../../../..
+```
+
+This places the headers in
+`third_party/wasm-micro-runtime/core/iwasm/include/` and the library at
+`third_party/wasm-micro-runtime/product-mini/platforms/linux/build/`,
+which CMake detects automatically.
 
 ## Building
 

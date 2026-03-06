@@ -23,7 +23,6 @@ set(PROXY_WASM_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/proxy-wasm-cpp-s
 
 # Collect proxy-wasm sources (explicitly list to avoid abseil dependency on hash.cc)
 set(PROXY_WASM_SOURCES
-  "${PROXY_WASM_HOST_DIR}/src/bytecode_util.cc"
   "${PROXY_WASM_HOST_DIR}/src/context.cc"
   "${PROXY_WASM_HOST_DIR}/src/exports.cc"
   "${PROXY_WASM_HOST_DIR}/src/pairs_util.cc"
@@ -33,6 +32,12 @@ set(PROXY_WASM_SOURCES
   "${PROXY_WASM_HOST_DIR}/src/vm_id_handle.cc"
   "${PROXY_WASM_HOST_DIR}/src/wasm.cc"
 )
+
+# bytecode_util.cc was added in proxy-wasm-cpp-host commit 8ccb826; include
+# it when present so older submodule revisions still build.
+if(EXISTS "${PROXY_WASM_HOST_DIR}/src/bytecode_util.cc")
+  list(APPEND PROXY_WASM_SOURCES "${PROXY_WASM_HOST_DIR}/src/bytecode_util.cc")
+endif()
 
 # Runtime detection flag
 set(HAVE_RUNTIME FALSE)
