@@ -661,7 +661,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Initialize logging: active if /tmp/lshttpd/lswasm.dolog exists or --debug is given.
+    // Initialize logging: active if /tmp/lswasm.dolog exists or --debug is given.
     lswasm_log::log_init(debug);
 
     // Initialize WASM module manager (must happen before signal handler

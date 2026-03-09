@@ -32,7 +32,7 @@
 namespace lswasm_log {
 
 // Sentinel file: logging is only active if this file exists at startup.
-inline constexpr const char *DOLOG_PATH = "/tmp/lshttpd/lswasm.dolog";
+inline constexpr const char *DOLOG_PATH = "/tmp/lswasm.dolog";
 // Log file path.
 inline constexpr const char *LOG_PATH = "/tmp/lswasm.log";
 

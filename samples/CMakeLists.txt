@@ -17,6 +17,9 @@ cmake_minimum_required(VERSION 3.16)
 
 # Fallback: if no toolchain file was used, configure the WASI SDK inline.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Generic" OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm32")
+  # Clear any stale CMAKE_TOOLCHAIN_FILE so CMake doesn't look for a
+  # non-existent file during project() when re-configuring without --fresh.
+  unset(CMAKE_TOOLCHAIN_FILE CACHE)
   set(WASI_SDK_PATH "" CACHE PATH "Path to the WASI SDK installation (e.g. /opt/wasi-sdk-29.0)")
 
   if(NOT WASI_SDK_PATH)

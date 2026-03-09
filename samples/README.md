@@ -21,7 +21,14 @@ Each lifecycle callback also logs a message via `LOG_INFO()`.
 
 * **WASI SDK** (≥ 29) — provides `clang++`, `wasm-ld`, and a wasi-sysroot
   with C++ headers (libc++/libc++abi).
-  Download from <https://github.com/WebAssembly/wasi-sdk/releases>.
+  Download from <https://github.com/WebAssembly/wasi-sdk/releases>.  For example:
+```bash
+cd third_party
+wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-29/wasi-sdk-29.0-x86_64-linux.tar.gz
+tar xf wasi-sdk-29.0-x86_64-linux.tar.gz
+cd ..
+```
+
 * **proxy-wasm-cpp-sdk** — included as a git submodule at
   `third_party/proxy-wasm-cpp-sdk/`.  Make sure submodules are initialised:
 
@@ -33,10 +40,12 @@ Each lifecycle callback also logs a message via `LOG_INFO()`.
 
 ### With CMake + toolchain file (recommended)
 
+Assuming the path to the WASI SDK is (as above): 
 ```bash
+mkdir samples/build
 cmake -S samples -B samples/build \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/wasm32-wasi-toolchain.cmake \
-  -DWASI_SDK_PATH=/path/to/wasi-sdk-29.0
+    -DCMAKE_TOOLCHAIN_FILE=$HOME/lswasm/cmake/wasm32-wasi-toolchain.cmake \
+    -DWASI_SDK_PATH=third_party/wasi-sdk-29.0-x86_64-linux
 cmake --build samples/build
 ```
 

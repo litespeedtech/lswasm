@@ -453,10 +453,88 @@ The uninstall script:
 3. Deletes the installed binary.
 4. Removes the install directory if it is empty.
 
+## Starting and Stopping the Service
+
+### systemd User Service
+
+If you installed lswasm via [`install.sh`](install.sh), it runs as a **systemd user service** that starts automatically on login.
+
+**Start** the service:
+
+```bash
+systemctl --user start lswasm.service
+```
+
+**Stop** the service:
+
+```bash
+systemctl --user stop lswasm.service
+```
+
+**Restart** the service (e.g. after updating a WASM module or changing configuration):
+
+```bash
+systemctl --user restart lswasm.service
+```
+
+**Check status:**
+
+```bash
+systemctl --user status lswasm.service
+```
+
+**View logs:**
+
+```bash
+journalctl --user -u lswasm.service -f
+```
+
+**Disable** the service from starting on login:
+
+```bash
+systemctl --user disable lswasm.service
+```
+
+**Re-enable** it:
+
+```bash
+systemctl --user enable lswasm.service
+```
+
+> **Note:** If you used a custom `--service-name` during installation, replace
+> `lswasm.service` with that name in the commands above.
+
+### Standalone (without systemd)
+
+When running lswasm directly from the command line, stop it with
+**Ctrl+C** (sends `SIGINT`) or by sending `SIGTERM`:
+
+```bash
+# Start in the foreground:
+./lswasm --module samples/sample_filter.wasm --port 8080
+
+# Stop with Ctrl+C, or from another terminal:
+kill $(pidof lswasm)
+```
+
+lswasm handles both `SIGINT` and `SIGTERM` for graceful shutdown — it stops
+accepting new connections, cleans up the Unix domain socket (if used), and
+exits.
+
 ## Testing
 
 By default, lswasm listens on a **Unix domain socket** at `/tmp/lswasm.sock`.
 Use `--port` to switch to TCP mode for direct `curl` testing.
+
+### Basic Health Check
+
+```bash
+# Start with the default UDS listener:
+./lswasm
+
+# In another terminal:
+curl --unix-socket /tmp/lswasm.sock http://localhost/
+```
 
 ### Basic Health Check (TCP mode)
 
@@ -473,16 +551,6 @@ curl http://localhost:8080/
 # Path: /
 # Version: HTTP/1.1
 # Runtime: Wasmtime
-```
-
-### Via Unix Domain Socket (default mode)
-
-```bash
-# Start with the default UDS listener:
-./lswasm
-
-# In another terminal:
-curl --unix-socket /tmp/lswasm.sock http://localhost/
 ```
 
 ### With netcat (TCP mode)
@@ -509,6 +577,36 @@ Runtime found: TRUE
 =========================================
 ```
 
+## Configuring LiteSpeed
+
+To configure LiteSpeed (Enterprise or OpenLiteSpeed) there are many ways to do it.  Note that lswasm runs as a separate HTTP server and LiteSpeed will operate as a proxy to it.  The instructions below assume:
+
+- An overall configuration.  This will work with OpenLiteSpeed and in LiteSpeed Enterprise in non-Apache mode.  In Apache mode, you will want to setup rewrite files to it.
+- You are just testing it out and thus will use the sample application (from above).
+- You will copy the sample application to the root of your server's Virtual Host directory ($LSWS_HOME/DEFAULT/html/ for LiteSpeed Enterprise's default Virtual Host or $LSWS_HOME/Example/html/ for OpenLiteSpeed's default Virtual Host).
+
+Many users will configure it for processing a particular directory on an existing listener, in which case you'd setup a Virtual Host context for it.  Or a particular port, in which case you'd configure a listener and a VirtualHost context.
+
+Navigate to: **Web Admin > Configuration > External App > Add**
+
+- Type = `Web Server`.  Press the **Next** button
+- Name = `wasm`.  A sample name that you can remember.
+- Address = `uds://tmp/lswasm.sock`.  The default UDS address.  If during the install you configured it to be installed elsewhere or with TCP you should specify the alternate location or http://<address>:<port>.
+- Max Connections = 20.  Specifies the maximum number of concurrent connections that can be established between the server and an external application.
+- Connection Keepalive Timeout = `60`.  Specifies the maximum time in seconds to keep an idle persistent connection open.
+- Initial Request Timeout (secs) = `60`.  Specifies the maximum time in seconds the server will wait for the external application to respond to the first request over a newly established connection. 
+- Retry Timeout (secs) = `60`.  Specifies the period of time that the server waits before retrying an external application that had a prior communication problem.
+
+Press the **Save** button to save your settings.  Press the **Script Handler** tab to setup an extension handler.
+
+- Suffixes = `wasm`.  This will trigger on any file with a .wasm extension.
+- Handler Type = `Web Server`.  This is the type of handler that lswasm runs as.
+- Handler Name = `wasm`.  Enter the name from the External App above.
+
+Press the **Save** button to save your settings.  Perform a **Graceful Restart** to apply the settings.
+
+In the default case, in a browser with the default settings: `http://localhost:8088/sample_filter.wasm` will display the output of the settings.
+
 ## Development
 
 ### Reconfiguring After Runtime Installation
@@ -526,6 +624,18 @@ cmake --build . -j$(nproc)
 Check `build/compile_commands.json` for detailed compiler configurations. This can be used by IDEs and tools like clangd for better editor support.
 
 ## Troubleshooting
+
+### Enabling lswasm logging
+
+lswasm logging can be enabled by either entering the `--debug` command line option to the executable or creating the trigger file `/tmp/lswasm.dolog`.  The log is written to /tmp/lswasm.log.  Any problems you have in lswasm should start with enabling logging and examining the log.
+
+### Verifying lswasm is working
+
+The instructions above include a [Basic Health Check](#basic-health-check).  Before relying on LiteSpeed's configuration you should verify the service is performing correctly with the basic health check.  If it is not, then enable lswasm logging and check the logs for errors.
+
+### Service output
+
+If you are running lswasm as a service, the important messages will be written to the system log files.  In most modern Linux systems, these can be examined with journalctl searching for lswasm.
 
 ### Runtime Not Found
 
