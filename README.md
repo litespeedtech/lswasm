@@ -6,14 +6,18 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 
 ## Features
 
-- Single-threaded, `epoll`-based HTTP server (Linux)
+- **Multi-threaded** `epoll`-based HTTP server (Linux) with configurable worker thread pool (`--workers N`)
+- Thread-local WASM VM cloning via proxy-wasm-cpp-host's `getOrCreateThreadLocalPlugin()` — each worker thread gets its own VM instance
 - TCP and **Unix domain socket** listeners
 - WASM filter module loading and execution via proxy-wasm-cpp-host
 - HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
 - **Response header manipulation** from WASM modules via proxy-wasm ABI
+- **Streaming response API** — WASM modules can send chunked/streaming HTTP responses via foreign functions (`lswasm_send_response_headers`, `lswasm_write_response_chunk`, `lswasm_finish_response`)
 - Support for Wasmtime, V8, WasmEdge, and WAMR runtimes (selectable via `-DWASM_RUNTIME=`)
 - Per-module environment variables (`--env KEY=VALUE`)
-- Graceful shutdown with signal handling (SIGINT, SIGTERM)
+- Reader-writer locked metrics (atomic counters/gauges) and reader-writer locked module registry
+- Thread-safe logging
+- Graceful shutdown with signal handling (SIGINT, SIGTERM) and ordered thread pool drain
 - Modular CMake-based build system
 
 ## Architecture
@@ -26,16 +30,30 @@ lswasm/
 ├── install.sh                      # Install lswasm as a systemd user service
 ├── uninstall.sh                    # Remove service and installed binary
 ├── src/
-│   ├── main.cpp                    # HTTP server (epoll loop, CLI, request handling)
-│   ├── http_filter.h               # HTTP filter context (filter chain lifecycle)
-│   ├── wasm_module_manager.h       # WASM module manager (load, execute, state)
+│   ├── main.cpp                    # HTTP server (epoll loop, CLI, thread pool dispatch)
+│   ├── http_filter.h               # HTTP filter context (per-request WASM scopes)
+│   ├── connection_io.h             # Worker ↔ epoll bridge for streaming I/O
+│   ├── http_utils.h                # HTTP utility functions (header serialization, etc.)
+│   ├── wasm_module_manager.h       # WASM module manager (thread-local VM cloning)
 │   ├── wasm_module_manager.cc      # WASM module manager implementation
-│   ├── log.h                       # Debug logging macros (file-based, --debug flag)
-│   └── hash_shim.cc               # Hash helper shim
+│   ├── thread_pool.h               # Fixed-size worker thread pool
+│   ├── log.h                       # Thread-safe debug logging (file-based, --debug flag)
+│   └── hash_shim.cc                # Hash helper shim
 ├── samples/
-│   ├── sample_filter.cpp           # Example WASM filter (C++ source)
-│   ├── CMakeLists.txt              # Build rules for samples
-│   └── README.md                   # Sample documentation
+│   ├── include/
+│   │   └── lswasm_streaming.h      # SDK-side convenience header for streaming API
+│   ├── sample_filter/
+│   │   ├── sample_filter.cpp       # Example WASM filter (C++ source)
+│   │   ├── CMakeLists.txt          # Build rules for sample_filter
+│   │   └── README.md               # Sample documentation
+│   ├── send_recv_all/
+│   │   ├── send_recv_all.cpp       # Buffered send/receive sample (C++ source)
+│   │   ├── CMakeLists.txt          # Build rules for send_recv_all
+│   │   └── README.md               # Sample documentation
+│   └── send_recv_stream/
+│       ├── send_recv_stream.cpp    # Streaming response sample (C++ source)
+│       ├── CMakeLists.txt          # Build rules for send_recv_stream
+│       └── README.md               # Sample documentation
 ├── cmake/
 │   └── wasm32-wasi-toolchain.cmake # Toolchain file for building WASM modules
 ├── third_party/
@@ -352,7 +370,16 @@ cmake --build . -j$(nproc)
 ./lswasm
 ```
 
-By default, lswasm listens on a Unix domain socket at `/tmp/lswasm.sock`.
+By default, lswasm listens on a Unix domain socket at `/tmp/lswasm.sock`
+using `std::thread::hardware_concurrency()` worker threads (or 4 if
+detection fails).
+
+### Custom Worker Count
+
+```bash
+# Use 8 worker threads
+./lswasm --workers 8
+```
 
 ### Custom TCP Port
 
@@ -371,13 +398,13 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 ### Loading a WASM Filter Module
 
 ```bash
-./lswasm --module samples/sample_filter.wasm
+./lswasm --module samples/sample_filter/sample_filter.wasm
 ```
 
 ### Passing Environment Variables to WASM Modules
 
 ```bash
-./lswasm --module samples/sample_filter.wasm --env MY_KEY=my_value --env ANOTHER=val
+./lswasm --module samples/sample_filter/sample_filter.wasm --env MY_KEY=my_value --env ANOTHER=val
 ```
 
 ### Help
@@ -395,6 +422,7 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 | `--sock-perm` | `MODE` | Set UDS file permissions in octal (default: `0666`) |
 | `--module` | `PATH` | Load a WASM filter module |
 | `--env` | `KEY=VALUE` | Set an environment variable for WASM modules (repeatable) |
+| `--workers` | `N` | Number of worker threads (default: `hardware_concurrency()` or 4) |
 | `--body-pacifier` | — | Include a diagnostic body in HTTP responses (request info, runtime, filters) |
 | `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
 | `--version` | — | Print version number and exit |
@@ -511,15 +539,16 @@ When running lswasm directly from the command line, stop it with
 
 ```bash
 # Start in the foreground:
-./lswasm --module samples/sample_filter.wasm --port 8080
+./lswasm --module samples/sample_filter/sample_filter.wasm --port 8080
 
 # Stop with Ctrl+C, or from another terminal:
 kill $(pidof lswasm)
 ```
 
 lswasm handles both `SIGINT` and `SIGTERM` for graceful shutdown — it stops
-accepting new connections, cleans up the Unix domain socket (if used), and
-exits.
+accepting new connections, drains the worker thread pool (waiting for
+in-flight requests to complete), cleans up the Unix domain socket (if used),
+destroys WASM module state, and exits.
 
 ## Testing
 
@@ -622,6 +651,75 @@ cmake --build . -j$(nproc)
 ### Viewing Compiler Commands
 
 Check `build/compile_commands.json` for detailed compiler configurations. This can be used by IDEs and tools like clangd for better editor support.
+
+## Streaming Response API
+
+lswasm extends the proxy-wasm ABI with three **foreign functions** that let a
+WASM filter stream HTTP responses incrementally instead of buffering the
+entire body in a single `sendLocalResponse()` call.  This is useful for large
+payloads, server-sent events, or any scenario where constant memory usage is
+important.
+
+### Foreign Functions
+
+| Function | Argument | Description |
+|----------|----------|-------------|
+| `lswasm_send_response_headers` | 4-byte status code + marshalled header pairs | Begin a streaming response with the given HTTP status and headers |
+| `lswasm_write_response_chunk` | Raw body bytes | Write a chunk of response body data to the client |
+| `lswasm_finish_response` | *(none)* | Signal end-of-response — no more chunks may be written |
+
+These are invoked via `proxy_call_foreign_function()` from the proxy-wasm
+SDK.
+
+### C++ Convenience Header
+
+Include `lswasm_streaming.h` (located at `samples/include/`) in your filter
+to get typed wrappers instead of calling `proxy_call_foreign_function()`
+directly:
+
+```cpp
+#include "lswasm_streaming.h"
+
+// In your stream context's onRequestHeaders or onRequestBody:
+
+// 1. Send response headers (starts the streaming response).
+lswasm::streaming::sendResponseHeaders(200, {
+    {"content-type", "text/plain"},
+    {"x-custom",     "value"},
+});
+
+// 2. Write body chunks as they become available.
+lswasm::streaming::writeResponseChunk(data, len);
+
+// 3. Finish the response.
+lswasm::streaming::finishResponse();
+```
+
+### Lifecycle Rules
+
+1. **`sendResponseHeaders`** must be called exactly once, before any chunks.
+2. **`writeResponseChunk`** may be called zero or more times.
+3. **`finishResponse`** must be called exactly once to close the response.
+4. Calling these out of order returns `WasmResult::BadArgument`.
+
+### Detecting Host Support
+
+If your filter must run on hosts that may not support the streaming API, call
+`lswasm::streaming::isSupported()` *before* `sendResponseHeaders()`.  It
+returns `false` on hosts that don't register the foreign functions (the call
+returns `WasmResult::NotFound`), letting you fall back to
+`sendLocalResponse()`.
+
+### Samples
+
+- **`samples/send_recv_stream/`** — Streaming echo filter that writes each
+  request body chunk back to the client as it arrives, maintaining constant
+  memory usage regardless of body size.
+- **`samples/send_recv_all/`** — Buffered send/receive filter that
+  accumulates the entire request body and responds with a single
+  `sendLocalResponse()`.  Good for small payloads.
+
+See each sample's `README.md` for build and usage instructions.
 
 ## Troubleshooting
 

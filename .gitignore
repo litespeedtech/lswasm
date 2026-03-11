@@ -16,10 +16,10 @@ lswasm
 *.a
 *.o
 *.so
-samples/*.wasm
+samples/**/*.wasm
 
 # Sample build directories
-samples/build*/
+samples/**/build*/
 
 # CMake
 CMakeLists.txt.user
@@ -35,5 +35,8 @@ third_party/wasmtime-src/
 
 # macOS
 .DS_Store
+
+# Debug logs
+server_debug.log
 
 plans/

@@ -50,9 +50,12 @@ bool WasmModuleManager::loadModule(const std::string &module_path,
 
 bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_size,
                                               const std::string &module_name) {
-  if (modules_.find(module_name) != modules_.end()) {
-    LOG_ERROR("Module already loaded: " << module_name);
-    return false;
+  {
+    std::shared_lock<std::shared_mutex> rlock(modules_mutex_);
+    if (modules_.find(module_name) != modules_.end()) {
+      LOG_ERROR("Module already loaded: " << module_name);
+      return false;
+    }
   }
 
   try {
@@ -96,48 +99,6 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
       LOG_INFO("Detected proxy-wasm ABI version " << abi_str << " for module: " << module_name);
     }
 
-    // Create a VM instance for the configured runtime.
-#if defined(WASM_RUNTIME_WASMTIME)
-    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWasmtimeVm();
-#elif defined(WASM_RUNTIME_V8)
-    LOG_INFO("Creating V8VM");
-    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createV8Vm();
-    LOG_INFO("Created V8VM");
-#elif defined(WASM_RUNTIME_WASMEDGE)
-    LOG_INFO("Creating WasmEdge VM");
-    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWasmEdgeVm();
-    LOG_INFO("Created WasmEdge VM");
-#elif defined(WASM_RUNTIME_WAMR)
-    LOG_INFO("Creating WAMR VM");
-    std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWamrVm();
-    LOG_INFO("Created WAMR VM");
-#else
-    LOG_ERROR("No WASM runtime available (build with -DWASM_RUNTIME=wasmtime, v8, wasmedge, or wamr)");
-    return false;
-#endif
-
-    // Attach integration (logging/error hooks).
-    vm->integration() = std::make_unique<lswasm::LsWasmIntegration>();
-
-    // Create the WasmBase with environment variables.
-    std::shared_ptr<lswasm::LsWasm> wasm = std::make_shared<lswasm::LsWasm>(
-        std::move(vm), envs_, module_name, /*vm_configuration=*/"", /*vm_key=*/module_name);
-
-    // Load the WASM bytecode.
-    std::string bytecode(reinterpret_cast<const char *>(code), code_size);
-    LOG_INFO("Loading bytecode");
-    if (!wasm->load(bytecode, /*allow_precompiled=*/false)) {
-      LOG_ERROR("Failed to load WASM bytecode for module: " << module_name);
-      return false;
-    }
-
-    // Initialize the VM (registers ABI callbacks, links imports, runs _initialize).
-    LOG_INFO("Initializing...");
-    if (!wasm->initialize()) {
-      LOG_ERROR("Failed to initialize WASM module: " << module_name);
-      return false;
-    }
-
     // Create a plugin for this module.
     // NOTE: root_id must match the root_id used in the SDK's RegisterContextFactory.
     // The proxy-wasm-cpp-sdk default is "" (empty string).  If the WASM module
@@ -163,9 +124,90 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
         /*fail_open=*/false,
         /*key=*/module_name);
 
-    // Start the VM (calls proxy_on_vm_start) and create a root context.
+    // Capture environment variables for clone factory.
+    auto envs = envs_;
+
+    // ---- Factory lambdas for the proxy-wasm thread-local cloning API ----
+
+    // WasmHandleFactory: creates a new base WasmHandle (called by createWasm()
+    // when no cached base exists for the given vm_key).
+    proxy_wasm::WasmHandleFactory wasm_handle_factory =
+        [envs](std::string_view vm_key) -> std::shared_ptr<proxy_wasm::WasmHandleBase> {
+#if defined(WASM_RUNTIME_WASMTIME)
+      std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWasmtimeVm();
+#elif defined(WASM_RUNTIME_V8)
+      LOG_INFO("Creating V8VM");
+      std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createV8Vm();
+      LOG_INFO("Created V8VM");
+#elif defined(WASM_RUNTIME_WASMEDGE)
+      LOG_INFO("Creating WasmEdge VM");
+      std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWasmEdgeVm();
+      LOG_INFO("Created WasmEdge VM");
+#elif defined(WASM_RUNTIME_WAMR)
+      LOG_INFO("Creating WAMR VM");
+      std::unique_ptr<proxy_wasm::WasmVm> vm = proxy_wasm::createWamrVm();
+      LOG_INFO("Created WAMR VM");
+#else
+      LOG_ERROR("No WASM runtime available");
+      return nullptr;
+#endif
+      vm->integration() = std::make_unique<lswasm::LsWasmIntegration>();
+
+      auto wasm = std::make_shared<lswasm::LsWasm>(
+          std::move(vm), envs, vm_key, /*vm_configuration=*/"", vm_key);
+      return std::make_shared<lswasm::LsWasmHandle>(std::move(wasm));
+    };
+
+    // WasmHandleCloneFactory: creates a thread-local VM clone from a base handle.
+    // Each clone gets its own V8 Store/Isolate (via WasmVm::clone()) and shares
+    // the MetricStore with the base VM.
+    //
+    // The LsWasm clone constructor delegates to WasmBase(base_handle, factory)
+    // which internally calls WasmVm::clone(), then getOrCreateThreadLocalWasm()
+    // calls load() + initialize() after the clone factory returns.
+    proxy_wasm::WasmHandleCloneFactory clone_factory =
+        [](std::shared_ptr<proxy_wasm::WasmHandleBase> base_handle)
+            -> std::shared_ptr<proxy_wasm::WasmHandleBase> {
+      auto cloned_wasm = std::make_shared<lswasm::LsWasm>(
+          base_handle, /*factory=*/nullptr);
+      return std::make_shared<lswasm::LsWasmHandle>(std::move(cloned_wasm));
+    };
+
+    // PluginHandleFactory: creates a PluginHandle wrapping a WasmHandle + Plugin.
+    proxy_wasm::PluginHandleFactory plugin_factory =
+        [](std::shared_ptr<proxy_wasm::WasmHandleBase> wasm_handle,
+           std::shared_ptr<proxy_wasm::PluginBase> plugin_base)
+            -> std::shared_ptr<proxy_wasm::PluginHandleBase> {
+      return std::make_shared<lswasm::LsPluginHandle>(
+          std::move(wasm_handle), std::move(plugin_base));
+    };
+
+    // Build the VM key for the base_wasms registry.
+    std::string bytecode(reinterpret_cast<const char *>(code), code_size);
+    std::string vm_key = proxy_wasm::makeVmKey(
+        /*vm_id=*/module_name, /*configuration=*/"", bytecode);
+
+    // Use createWasm() to create (or retrieve cached) base VM handle.
+    // This also runs load(), initialize(), start(), configure(), and canary.
+    LOG_INFO("Creating base WASM handle via createWasm()...");
+    auto base_handle = proxy_wasm::createWasm(
+        vm_key, bytecode, plugin, wasm_handle_factory, clone_factory,
+        /*allow_precompiled=*/false);
+    if (!base_handle) {
+      LOG_ERROR("Failed to create base WASM handle for module: " << module_name);
+      return false;
+    }
+
+    // Verify the base handle contains an LsWasm instance.
+    auto base_lswasm = std::dynamic_pointer_cast<lswasm::LsWasm>(base_handle->wasm());
+    if (!base_lswasm) {
+      LOG_ERROR("Base handle does not contain an LsWasm instance for module: " << module_name);
+      return false;
+    }
+
+    // Start the VM (calls proxy_on_vm_start) and create a root context on the base VM.
     LOG_INFO("Starting VM and creating root context...");
-    proxy_wasm::ContextBase *root_context = wasm->start(plugin);
+    proxy_wasm::ContextBase *root_context = base_lswasm->start(plugin);
     if (!root_context) {
       LOG_ERROR("Failed to start WASM module: " << module_name);
       return false;
@@ -173,15 +215,21 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
 
     // Configure the plugin (calls proxy_on_configure).
     LOG_INFO("Configuring plugin...");
-    if (!wasm->configure(root_context, plugin)) {
+    if (!base_lswasm->configure(root_context, plugin)) {
       LOG_ERROR("Failed to configure WASM module: " << module_name);
       return false;
     }
 
     ModuleState state;
-    state.wasm = wasm;
-    state.plugin = plugin;
-    modules_[module_name] = std::move(state);
+    state.base_handle = std::move(base_handle);
+    state.plugin = std::move(plugin);
+    state.clone_factory = std::move(clone_factory);
+    state.plugin_factory = std::move(plugin_factory);
+
+    {
+      std::unique_lock<std::shared_mutex> wlock(modules_mutex_);
+      modules_[module_name] = std::move(state);
+    }
 
     LOG_INFO("Module loaded and initialized successfully: " << module_name);
     return true;
@@ -192,181 +240,22 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
   }
 }
 
-bool WasmModuleManager::ensureStreamContext(const std::string &module_name, uint32_t context_id) {
-  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
+bool WasmModuleManager::createRequestScope(const std::string &module_name,
+                                            uint32_t context_id,
+                                            RequestScope &scope) const {
+  std::shared_lock<std::shared_mutex> rlock(modules_mutex_);
+  auto it = modules_.find(module_name);
   if (it == modules_.end()) {
     LOG_ERROR("Module not found: " << module_name);
     return false;
   }
 
-  ModuleState &state = it->second;
-  std::shared_ptr<lswasm::LsWasm> &wasm = state.wasm;
-
-  if (!wasm || wasm->isFailed()) {
-    LOG_ERROR("Module VM not available or failed: " << module_name);
-    return false;
-  }
-
-  // Already have a stream context for this context_id — nothing to do.
-  if (state.stream_context && state.stream_context_id == context_id) {
-    return true;
-  }
-
-  // Get the root context for this plugin.
-  proxy_wasm::ContextBase *root_ctx = wasm->getRootContext(state.plugin, false);
-  if (!root_ctx) {
-    LOG_ERROR("No root context for module: " << module_name);
-    return false;
-  }
-
-  // Create a stream context via proxy_on_context_create.
-  // NOTE: LsWasm::createContext() uses the ContextBase(WasmBase*, PluginBase)
-  // constructor which makes the new context look like a root context
-  // (parent_context_ == this).  We must patch the parent to the real
-  // root context BEFORE calling onCreate(), so that
-  // proxy_on_context_create(stream_id, root_id) passes the correct
-  // root_context_id to the in-VM SDK.
-  proxy_wasm::ContextBase *ctx = wasm->createContext(state.plugin);
-  if (!ctx) {
-    LOG_ERROR("Failed to create stream context for module: " << module_name);
-    return false;
-  }
-
-  lswasm::LsWasmContext *lswasm_ctx = dynamic_cast<lswasm::LsWasmContext *>(ctx);
-  if (lswasm_ctx) {
-    lswasm_ctx->setParentContext(root_ctx);
-  }
-
-  ctx->onCreate();
-
-  state.stream_context = dynamic_cast<lswasm::LsWasmContext *>(ctx);
-  state.stream_context_id = context_id;
-
-  if (state.stream_context) {
-    state.stream_context->resetLocalResponse();
-    state.stream_context->resetHeaderMaps();
-  }
-
-  return true;
-}
-
-bool WasmModuleManager::executeFilter(const std::string &module_name, uint32_t context_id,
-                                       const std::string &phase) {
-  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
-  if (it == modules_.end()) {
-    LOG_ERROR("Module not found: " << module_name);
-    return false;
-  }
-
-  ModuleState &state = it->second;
-  std::shared_ptr<lswasm::LsWasm> &wasm = state.wasm;
-
-  if (!wasm || wasm->isFailed()) {
-    LOG_ERROR("Module VM not available or failed: " << module_name);
-    return false;
-  }
-
-  LOG_INFO("[WASM] Executing " << phase << " phase for module: " << module_name
-            << " (context_id: " << context_id << ")");
-
-  try {
-    // Ensure the stream context exists for this request.
-    if (!ensureStreamContext(module_name, context_id)) {
-      return false;
-    }
-
-    if (phase == "onRequestHeaders") {
-      if (state.stream_context) {
-        state.stream_context->onRequestHeaders(0, true);
-      }
-    } else if (phase == "onRequestBody") {
-      if (state.stream_context) {
-        state.stream_context->onRequestBody(0, true);
-      }
-    } else if (phase == "onRequestTrailers") {
-      if (state.stream_context) {
-        state.stream_context->onRequestTrailers(0);
-      }
-    } else if (phase == "onResponseHeaders") {
-      if (state.stream_context) {
-        state.stream_context->onResponseHeaders(0, true);
-      }
-    } else if (phase == "onResponseBody") {
-      if (state.stream_context) {
-        state.stream_context->onResponseBody(0, true);
-      }
-    } else if (phase == "onResponseTrailers") {
-      if (state.stream_context) {
-        state.stream_context->onResponseTrailers(0);
-      }
-    } else if (phase == "onDone") {
-      if (state.stream_context) {
-        state.stream_context->onDone();
-      }
-    } else {
-      LOG_INFO("[WASM] Unknown phase: " << phase);
-    }
-
-    return true;
-
-  } catch (const std::exception &e) {
-    LOG_ERROR("[WASM] Error executing " << phase << " for " << module_name << ": " << e.what());
-    return false;
-  }
-}
-
-std::string WasmModuleManager::getLocalResponseBody(const std::string &module_name) const {
-  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
-  if (it != modules_.end() && it->second.stream_context) {
-    return it->second.stream_context->localResponseBody();
-  }
-  return "";
-}
-
-uint32_t WasmModuleManager::getLocalResponseCode(const std::string &module_name) const {
-  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
-  if (it != modules_.end() && it->second.stream_context) {
-    return it->second.stream_context->localResponseCode();
-  }
-  return 0;
-}
-
-bool WasmModuleManager::hasLocalResponse(const std::string &module_name) const {
-  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
-  if (it != modules_.end() && it->second.stream_context) {
-    return it->second.stream_context->hasLocalResponse();
-  }
-  return false;
-}
-
-HeaderPairs WasmModuleManager::getLocalResponseHeaders(const std::string &module_name) const {
-  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
-  if (it != modules_.end() && it->second.stream_context) {
-    return it->second.stream_context->localResponseHeaders();
-  }
-  return {};
-}
-
-void WasmModuleManager::setContextHeaders(const std::string &module_name,
-                                           proxy_wasm::WasmHeaderMapType type,
-                                           const HeaderPairs &pairs) {
-  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
-  if (it != modules_.end() && it->second.stream_context) {
-    it->second.stream_context->setHeaderMap(type, pairs);
-  }
-}
-
-HeaderPairs WasmModuleManager::getContextHeaders(const std::string &module_name,
-                                                   proxy_wasm::WasmHeaderMapType type) const {
-  std::map<std::string, ModuleState>::const_iterator it = modules_.find(module_name);
-  if (it != modules_.end() && it->second.stream_context) {
-    return it->second.stream_context->getHeaderMapOwned(type);
-  }
-  return {};
+  return scope.init(it->second, context_id);
 }
 
 bool WasmModuleManager::unloadModule(const std::string &module_name) {
-  std::map<std::string, ModuleState>::iterator it = modules_.find(module_name);
+  std::unique_lock<std::shared_mutex> wlock(modules_mutex_);
+  auto it = modules_.find(module_name);
   if (it == modules_.end()) {
     LOG_ERROR("Module not found: " << module_name);
     return false;
@@ -378,13 +267,15 @@ bool WasmModuleManager::unloadModule(const std::string &module_name) {
 }
 
 std::vector<std::string> WasmModuleManager::getLoadedModules() const {
+  std::shared_lock<std::shared_mutex> rlock(modules_mutex_);
   std::vector<std::string> result;
-  for (const std::pair<const std::string, ModuleState> &pair : modules_) {
-    result.push_back(pair.first);
+  for (const auto &[name, _state] : modules_) {
+    result.push_back(name);
   }
   return result;
 }
 
 bool WasmModuleManager::hasModule(const std::string &module_name) const {
+  std::shared_lock<std::shared_mutex> rlock(modules_mutex_);
   return modules_.find(module_name) != modules_.end();
 }

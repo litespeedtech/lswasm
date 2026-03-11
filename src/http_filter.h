@@ -53,15 +53,57 @@ struct HttpData {
 /**
  * HttpFilterContext - Represents an HTTP filter processing context
  * This is the host-side equivalent that manages filter execution
+ *
+ * Thread safety: each HttpFilterContext instance is used by a single
+ * thread (the worker handling the request).  The RequestScope creates
+ * per-thread WASM VM clones via getOrCreateThreadLocalPlugin().
+ *
+ * Lifetime: WASM contexts are created once during onRequestHeaders()
+ * and persist across all subsequent phases (onRequestBody, onRequestTrailers,
+ * onResponseHeaders, etc.) until the HttpFilterContext is destroyed.
+ * This allows stateful WASM filters to accumulate data across phases.
  */
 class HttpFilterContext {
 public:
   HttpFilterContext(uint32_t context_id, HttpData *http_data)
       : context_id_(context_id), http_data_(http_data) {}
 
+  /// Inject the ConnectionIO for this request so that streaming response
+  /// foreign-function handlers can write directly to the client socket.
+  void setConnectionIO(ConnectionIO *conn) { conn_ = conn; }
+
+  /// True if any WASM context in the filter chain started a streaming
+  /// response (i.e. called lswasm_send_response_headers).
+  bool hasStreamingResponse() const {
+    for (const auto &[name, scope] : scopes_) {
+      if (scope.context() && scope.context()->hasStreamingResponse())
+        return true;
+    }
+    return false;
+  }
+
+  /// True if the streaming response has been finished (lswasm_finish_response
+  /// was called).
+  bool isStreamingFinished() const {
+    for (const auto &[name, scope] : scopes_) {
+      if (scope.context() && scope.context()->isStreamingFinished())
+        return true;
+    }
+    return false;
+  }
+
   // note: global module manager is declared externally (see below)
 
-  ~HttpFilterContext() = default;
+  ~HttpFilterContext() {
+    // Scopes are destroyed here, which calls onDone()/onDelete() on each
+    // WASM stream context via the RequestScope destructor.
+    scopes_.clear();
+    module_order_.clear();
+  }
+
+  // Non-copyable (owns RequestScopes).
+  HttpFilterContext(const HttpFilterContext &) = delete;
+  HttpFilterContext &operator=(const HttpFilterContext &) = delete;
 
   // Lifecycle callbacks
   void onCreate() {
@@ -73,15 +115,13 @@ public:
   }
 
   // HTTP stream lifecycle hooks (filter callback points)
-  
-  // NOTE on has_local_response checks:
-  //   onRequestHeaders is the only phase that can *set* has_local_response
-  //   (via checkLocalResponse after executeFilter).  All other phases check
-  //   the flag *before* calling executeFilter so they short-circuit the
-  //   entire chain immediately if a prior phase already produced a local
-  //   response.
-  void onRequestHeaders() {
-    LOG_INFO("[Filter] onRequestHeaders called (context_id: " << context_id_ << ")");
+
+  // onRequestHeaders creates a RequestScope per loaded module and keeps it
+  // alive for the duration of the request.  Subsequent phases reuse the
+  // same WASM stream context so filter-level member variables persist.
+  void onRequestHeaders(bool end_of_stream = true) {
+    LOG_INFO("[Filter] onRequestHeaders called (context_id: " << context_id_
+             << ", end_of_stream=" << end_of_stream << ")");
 
     // Proxy-wasm filters expect HTTP/2-style pseudo-headers in the request
     // header map.  Synthesize them from the parsed HTTP/1.1 request line
@@ -90,154 +130,141 @@ public:
 
     if (g_module_manager) {
       for (const std::string &m : g_module_manager->getLoadedModules()) {
-        // Ensure the stream context exists *before* setting headers.
-        // executeFilter() used to lazily create the context, which meant
-        // setContextHeaders() found no stream_context and silently dropped
-        // the headers.
-        g_module_manager->ensureStreamContext(m, context_id_);
+        WasmModuleManager::RequestScope scope;
+        if (!g_module_manager->createRequestScope(m, context_id_, scope)) {
+          LOG_ERROR("[Filter] Failed to create RequestScope for module '" << m << "'");
+          continue;
+        }
+        // Inject ConnectionIO for streaming response support.
+        // Thread safety: conn_ is set once here on the worker thread and
+        // only used by this same worker thread during WASM callbacks.
+        // ConnectionIO::writeData() has its own internal mutex protection
+        // for the worker↔epoll boundary.
+        scope.context()->setConnectionIO(conn_);
         // Push request headers into the WASM context before execution.
-        g_module_manager->setContextHeaders(
-            m, proxy_wasm::WasmHeaderMapType::RequestHeaders, http_data_->request_headers);
-        g_module_manager->executeFilter(m, context_id_, "onRequestHeaders");
+        scope.context()->setHeaderMap(
+            proxy_wasm::WasmHeaderMapType::RequestHeaders, http_data_->request_headers);
+        scope.context()->onRequestHeaders(0, end_of_stream);
         // Pull back any modifications the WASM module made to request headers.
-        http_data_->request_headers = g_module_manager->getContextHeaders(
-            m, proxy_wasm::WasmHeaderMapType::RequestHeaders);
+        http_data_->request_headers = scope.context()->getHeaderMapOwned(
+            proxy_wasm::WasmHeaderMapType::RequestHeaders);
         // Check if the WASM module sent a local response.
-        checkLocalResponse(m);
+        checkLocalResponse(scope, m);
+
+        // Store the scope for reuse in later phases.
+        module_order_.push_back(m);
+        scopes_.emplace(m, std::move(scope));
+
         if (http_data_->has_local_response) break;  // Stop filter chain
       }
     }
   }
 
-  void onRequestBody() {
-    LOG_INFO("[Filter] onRequestBody called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        if (http_data_->has_local_response) break;
-        g_module_manager->executeFilter(m, context_id_, "onRequestBody");
-      }
+  void onRequestBody(bool end_of_stream = true) {
+    LOG_INFO("[Filter] onRequestBody called (context_id: " << context_id_
+             << ", body_size=" << http_data_->request_body.size()
+             << ", eos=" << end_of_stream << ")");
+    for (const std::string &m : module_order_) {
+      if (http_data_->has_local_response) break;
+      auto it = scopes_.find(m);
+      if (it == scopes_.end() || !it->second.valid()) continue;
+      auto *ctx = it->second.context();
+      // Set body buffer and end-of-stream flag on the WASM context
+      // so that proxy_get_buffer_bytes(HttpRequestBody) returns the
+      // current chunk data.
+      ctx->setRequestBody(http_data_->request_body);
+      ctx->setEndOfStream(end_of_stream);
+      ctx->onRequestBody(http_data_->request_body.size(), end_of_stream);
+      checkLocalResponse(it->second, m);
     }
   }
 
   void onRequestTrailers() {
     LOG_INFO("[Filter] onRequestTrailers called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        if (http_data_->has_local_response) break;
-        g_module_manager->executeFilter(m, context_id_, "onRequestTrailers");
-      }
+    for (const std::string &m : module_order_) {
+      if (http_data_->has_local_response) break;
+      auto it = scopes_.find(m);
+      if (it == scopes_.end() || !it->second.valid()) continue;
+      it->second.context()->onRequestTrailers(0);
+      checkLocalResponse(it->second, m);
     }
   }
 
   void onResponseHeaders() {
     LOG_INFO("[Filter] onResponseHeaders called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        if (http_data_->has_local_response) break;
-        // Push response headers into the WASM context before execution.
-        g_module_manager->setContextHeaders(
-            m, proxy_wasm::WasmHeaderMapType::ResponseHeaders, http_data_->response_headers);
-        g_module_manager->executeFilter(m, context_id_, "onResponseHeaders");
-        // Pull back any modifications the WASM module made to response headers.
-        http_data_->response_headers = g_module_manager->getContextHeaders(
-            m, proxy_wasm::WasmHeaderMapType::ResponseHeaders);
-      }
+    for (const std::string &m : module_order_) {
+      if (http_data_->has_local_response) break;
+      auto it = scopes_.find(m);
+      if (it == scopes_.end() || !it->second.valid()) continue;
+      auto *ctx = it->second.context();
+      // Push response headers into the WASM context before execution.
+      ctx->setHeaderMap(
+          proxy_wasm::WasmHeaderMapType::ResponseHeaders, http_data_->response_headers);
+      ctx->onResponseHeaders(0, true);
+      // Pull back any modifications the WASM module made to response headers.
+      http_data_->response_headers = ctx->getHeaderMapOwned(
+          proxy_wasm::WasmHeaderMapType::ResponseHeaders);
     }
   }
 
   void onResponseBody() {
     LOG_INFO("[Filter] onResponseBody called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        if (http_data_->has_local_response) break;
-        g_module_manager->executeFilter(m, context_id_, "onResponseBody");
-      }
+    for (const std::string &m : module_order_) {
+      if (http_data_->has_local_response) break;
+      auto it = scopes_.find(m);
+      if (it == scopes_.end() || !it->second.valid()) continue;
+      it->second.context()->onResponseBody(0, true);
     }
   }
 
   void onResponseTrailers() {
     LOG_INFO("[Filter] onResponseTrailers called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        if (http_data_->has_local_response) break;
-        g_module_manager->executeFilter(m, context_id_, "onResponseTrailers");
-      }
+    for (const std::string &m : module_order_) {
+      if (http_data_->has_local_response) break;
+      auto it = scopes_.find(m);
+      if (it == scopes_.end() || !it->second.valid()) continue;
+      it->second.context()->onResponseTrailers(0);
     }
   }
 
   void onDone() {
     LOG_INFO("[Filter] Stream processing complete (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onDone");
-      }
-    }
+    // Scopes are cleaned up in the destructor, which calls onDone()/onDelete()
+    // on each WASM stream context.
   }
 
   // Metadata handling
   void onRequestMetadata() {
     LOG_INFO("[Filter] onRequestMetadata called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onRequestMetadata");
-      }
-    }
+    // No proxy-wasm ABI callback for metadata; reserved for future use.
   }
 
   void onResponseMetadata() {
     LOG_INFO("[Filter] onResponseMetadata called (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onResponseMetadata");
-      }
-    }
+    // No proxy-wasm ABI callback for metadata; reserved for future use.
   }
 
   // Connection events
   void onNewConnection() {
     LOG_INFO("[Filter] New connection (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onNewConnection");
-      }
-    }
+    // Connection-level events are not used in the per-request model.
   }
 
   void onDownstreamConnectionClose() {
     LOG_INFO("[Filter] Downstream connection closed (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onDownstreamConnectionClose");
-      }
-    }
   }
 
   void onUpstreamConnectionClose() {
     LOG_INFO("[Filter] Upstream connection closed (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onUpstreamConnectionClose");
-      }
-    }
   }
 
   // Data events
   void onDownstreamData() {
     LOG_INFO("[Filter] Downstream data (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onDownstreamData");
-      }
-    }
   }
 
   void onUpstreamData() {
     LOG_INFO("[Filter] Upstream data (context_id: " << context_id_ << ")");
-    if (g_module_manager) {
-      for (const std::string &m : g_module_manager->getLoadedModules()) {
-        g_module_manager->executeFilter(m, context_id_, "onUpstreamData");
-      }
-    }
   }
 
   // Accessors
@@ -293,13 +320,13 @@ private:
     }
   }
 
-  void checkLocalResponse(const std::string &module_name) {
-    if (g_module_manager && g_module_manager->hasLocalResponse(module_name)) {
+  void checkLocalResponse(WasmModuleManager::RequestScope &scope,
+                          const std::string &module_name) {
+    if (scope.context() && scope.context()->hasLocalResponse()) {
       http_data_->has_local_response = true;
-      http_data_->local_response_code = g_module_manager->getLocalResponseCode(module_name);
-      http_data_->local_response_body = g_module_manager->getLocalResponseBody(module_name);
-      http_data_->local_response_additional_headers =
-          g_module_manager->getLocalResponseHeaders(module_name);
+      http_data_->local_response_code = scope.context()->localResponseCode();
+      http_data_->local_response_body = scope.context()->localResponseBody();
+      http_data_->local_response_additional_headers = scope.context()->localResponseHeaders();
       LOG_INFO("[Filter] WASM module '" << module_name
                 << "' sent local response (code=" << http_data_->local_response_code
                 << ", body_size=" << http_data_->local_response_body.size()
@@ -310,6 +337,12 @@ private:
 
   uint32_t context_id_;
   HttpData *http_data_;
+  ConnectionIO *conn_ = nullptr;  // Injected for streaming response support.
+
+  // Persistent WASM contexts — created once in onRequestHeaders(), reused
+  // across all subsequent phases, destroyed in ~HttpFilterContext().
+  std::vector<std::string> module_order_;
+  std::map<std::string, WasmModuleManager::RequestScope> scopes_;
 };
 
 /**

@@ -21,14 +21,18 @@
 #include <string>
 #include <memory>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 #include <iostream>
 #include <chrono>
 
 #include "log.h"
+#include "http_utils.h"
 
 #include "proxy-wasm/wasm_vm.h"
 #include "proxy-wasm/wasm.h"
@@ -44,8 +48,15 @@
 #include "proxy-wasm/wamr.h"
 #endif
 
-// Owned header pairs type (std::string, not string_view).
-using HeaderPairs = std::vector<std::pair<std::string, std::string>>;
+// ConnectionIO is needed for the streaming response methods in LsWasmContext.
+#include "connection_io.h"
+
+// Streaming response state machine for LsWasmContext.
+enum class StreamingResponseState {
+  Idle,          // No streaming response in progress (default).
+  HeadersSent,   // Response status line + headers have been written.
+  Finished       // Final chunk sent; response is complete.
+};
 
 // Case-insensitive comparison for HTTP header field names (RFC 7230 §3.2).
 inline bool header_name_eq(std::string_view a, std::string_view b) {
@@ -191,6 +202,18 @@ public:
           return &buffer_;
         }
         return nullptr;
+      case proxy_wasm::WasmBufferType::HttpRequestBody:
+        if (!request_body_.empty()) {
+          buffer_.set(request_body_);
+          return &buffer_;
+        }
+        return nullptr;
+      case proxy_wasm::WasmBufferType::HttpResponseBody:
+        if (!response_body_.empty()) {
+          buffer_.set(response_body_);
+          return &buffer_;
+        }
+        return nullptr;
       default:
         LOG_INFO("[WASM] getBuffer: unsupported buffer type "
                  << static_cast<int>(type));
@@ -199,9 +222,20 @@ public:
   }
 
   bool endOfStream(proxy_wasm::WasmStreamType /* type */) override {
-    // For the simple request model, always report end of stream.
-    return true;
+    return end_of_stream_;
   }
+
+  // Set the request body data for the current chunk (called by the host
+  // before invoking onRequestBody).
+  void setRequestBody(std::string_view body) { request_body_ = body; }
+
+  // Set the response body data for the current chunk (called by the host
+  // before invoking onResponseBody).
+  void setResponseBody(std::string_view body) { response_body_ = body; }
+
+  // Set the end-of-stream flag (called by the host before invoking
+  // onRequestBody / onResponseBody).
+  void setEndOfStream(bool eos) { end_of_stream_ = eos; }
 
   // Property accessor — the proxy-wasm-cpp-SDK calls proxy_get_property
   // during proxy_on_context_create to obtain "plugin_root_id", which is
@@ -417,6 +451,94 @@ public:
     header_maps_.clear();
   }
 
+  // ---- Streaming response API ----
+  // These methods are called by the foreign-function handlers registered
+  // in main.cpp.  They delegate I/O to the ConnectionIO object that was
+  // injected via setConnectionIO().
+
+  /// Inject the ConnectionIO for this request (called by HttpFilterContext).
+  void setConnectionIO(ConnectionIO *conn) { conn_ = conn; }
+
+  /// Current streaming state.
+  StreamingResponseState streamingState() const { return streaming_state_; }
+
+  /// True if a streaming response has been started (headers sent).
+  bool hasStreamingResponse() const {
+    return streaming_state_ != StreamingResponseState::Idle;
+  }
+
+  /// True if the streaming response has been finished.
+  bool isStreamingFinished() const {
+    return streaming_state_ == StreamingResponseState::Finished;
+  }
+
+  /// Send the HTTP response status line and headers via ConnectionIO.
+  /// Must be called exactly once before any streamingWriteChunk() calls.
+  /// Returns Ok on success, or an error WasmResult.
+  proxy_wasm::WasmResult streamingSendHeaders(uint32_t status_code,
+                                              const HeaderPairs &headers) {
+    if (!conn_) {
+      LOG_ERROR("[Streaming] no ConnectionIO — cannot send headers");
+      return proxy_wasm::WasmResult::InternalFailure;
+    }
+    if (streaming_state_ != StreamingResponseState::Idle) {
+      LOG_ERROR("[Streaming] headers already sent");
+      return proxy_wasm::WasmResult::BadArgument;
+    }
+    std::string hdr_str = http_utils::serialize_headers(status_code, headers);
+    conn_->writeData(std::move(hdr_str));
+    streaming_state_ = StreamingResponseState::HeadersSent;
+    LOG_INFO("[Streaming] sent headers: status=" << status_code
+             << " header_count=" << headers.size());
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /// Write a chunk of body data.  May be called zero or more times after
+  /// streamingSendHeaders() and before streamingFinish().
+  proxy_wasm::WasmResult streamingWriteChunk(std::string_view data) {
+    if (!conn_) {
+      LOG_ERROR("[Streaming] no ConnectionIO — cannot write chunk");
+      return proxy_wasm::WasmResult::InternalFailure;
+    }
+    if (streaming_state_ != StreamingResponseState::HeadersSent) {
+      LOG_ERROR("[Streaming] writeChunk called in wrong state ("
+                << static_cast<int>(streaming_state_) << ")");
+      return proxy_wasm::WasmResult::BadArgument;
+    }
+    if (!data.empty()) {
+      // Copy the data into a std::string because writeData() blocks until
+      // the epoll loop drains the buffer, and the WASM linear memory
+      // backing this string_view may not remain valid across that wait.
+      conn_->writeData(std::string(data.data(), data.size()));
+    }
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /// Signal that the response is complete.  No more chunks may be written.
+  proxy_wasm::WasmResult streamingFinish() {
+    if (!conn_) {
+      LOG_ERROR("[Streaming] no ConnectionIO — cannot finish");
+      return proxy_wasm::WasmResult::InternalFailure;
+    }
+    if (streaming_state_ != StreamingResponseState::HeadersSent) {
+      LOG_ERROR("[Streaming] finish called in wrong state ("
+                << static_cast<int>(streaming_state_) << ")");
+      return proxy_wasm::WasmResult::BadArgument;
+    }
+    streaming_state_ = StreamingResponseState::Finished;
+    // Do NOT call conn_->finish() here — the host's handle_request()
+    // owns the lifecycle and will call finish() after the filter chain
+    // returns.
+    LOG_INFO("[Streaming] response finished");
+    return proxy_wasm::WasmResult::Ok;
+  }
+
+  /// Reset streaming state between requests (if context is reused).
+  void resetStreamingState() {
+    conn_ = nullptr;
+    streaming_state_ = StreamingResponseState::Idle;
+  }
+
 private:
   // Helper: downcast wasm() to LsWasm* (defined out-of-line after LsWasm).
   inline LsWasm *lswasm();
@@ -431,17 +553,28 @@ private:
   // Per-request header maps keyed by WasmHeaderMapType.  Stored as owned strings.
   std::map<proxy_wasm::WasmHeaderMapType, HeaderPairs> header_maps_;
 
+  // Per-request body data set by the host before filter callbacks.
+  std::string_view request_body_;
+  std::string_view response_body_;
+  bool end_of_stream_ = true;
+
   // Scratch buffer for getBuffer() — points into owned data elsewhere
-  // (plugin_configuration_, vm_configuration, etc.).
+  // (plugin_configuration_, vm_configuration, body data, etc.).
   proxy_wasm::BufferBase buffer_;
+
+  // ---- Streaming response state ----
+  ConnectionIO *conn_ = nullptr;
+  StreamingResponseState streaming_state_ = StreamingResponseState::Idle;
 };
 
 /**
- * LsWasm - Custom WasmBase for lswasm.
- * Overrides context creation to use LsWasmContext.
- */
-/**
  * MetricStore - In-memory metric storage for a WASM module.
+ *
+ * Thread safety:
+ *   - define() is protected by a std::mutex (cold path, only called during
+ *     module initialization or occasional metric definition).
+ *   - increment(), record(), get() use std::atomic<int64_t> for lock-free
+ *     access on the hot path.
  *
  * Metrics are identified by a uint32_t ID whose low 2 bits encode the
  * MetricType (Counter=0, Gauge=1, Histogram=2), matching the convention
@@ -462,16 +595,36 @@ public:
 
   struct MetricEntry {
     std::string name;
-    uint32_t type;       // proxy_wasm::MetricType cast to uint32_t
-    int64_t  value = 0;  // signed to support negative gauge deltas
+    uint32_t type;                    // proxy_wasm::MetricType cast to uint32_t
+    std::atomic<int64_t> value{0};    // signed to support negative gauge deltas
+
+    MetricEntry() : type(0) {}
+    MetricEntry(std::string n, uint32_t t) : name(std::move(n)), type(t) {}
+
+    // Non-copyable due to atomic — provide move semantics.
+    MetricEntry(MetricEntry &&other) noexcept
+        : name(std::move(other.name)), type(other.type),
+          value(other.value.load(std::memory_order_relaxed)) {}
+    MetricEntry &operator=(MetricEntry &&other) noexcept {
+      name = std::move(other.name);
+      type = other.type;
+      value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      return *this;
+    }
+
+    MetricEntry(const MetricEntry &) = delete;
+    MetricEntry &operator=(const MetricEntry &) = delete;
   };
 
   /**
    * Define (or look up) a metric.
    * If a metric with the same name and type already exists, the existing
    * ID is returned (idempotent).
+   * Thread-safe: protected by define_mutex_.
    */
   proxy_wasm::WasmResult define(uint32_t type, std::string_view name, uint32_t *id_out) {
+    std::unique_lock<std::shared_mutex> lock(define_mutex_);
+
     // Check for an existing metric with the same name.
     for (const auto &[id, entry] : metrics_) {
       if (entry.name == name) {
@@ -489,11 +642,7 @@ public:
     uint32_t id = next;
     next += kIdIncrement;
 
-    MetricEntry entry;
-    entry.name = std::string(name);
-    entry.type = type;
-    entry.value = 0;
-    metrics_[id] = std::move(entry);
+    metrics_.emplace(id, MetricEntry(std::string(name), type));
 
     LOG_INFO("[Metrics] defined " << metricTypeName(type)
              << " '" << name << "' → id " << id);
@@ -504,13 +653,16 @@ public:
 
   /**
    * Increment a Counter (or Gauge) by the given offset.
+   * Thread-safe: shared lock on define_mutex_ protects the map lookup;
+   * atomic fetch_add protects the value.
    */
   proxy_wasm::WasmResult increment(uint32_t id, int64_t offset) {
+    std::shared_lock<std::shared_mutex> lock(define_mutex_);
     auto it = metrics_.find(id);
     if (it == metrics_.end()) {
       return proxy_wasm::WasmResult::NotFound;
     }
-    it->second.value += offset;
+    it->second.value.fetch_add(offset, std::memory_order_relaxed);
     return proxy_wasm::WasmResult::Ok;
   }
 
@@ -519,32 +671,38 @@ public:
    * Counter:   value is added (same as increment with a positive offset).
    * Gauge:     value replaces the current reading.
    * Histogram: value is added to a running sum (simplified).
+   * Thread-safe: shared lock on define_mutex_ protects the map lookup;
+   * atomic operations protect the value.
    */
   proxy_wasm::WasmResult record(uint32_t id, uint64_t value) {
+    std::shared_lock<std::shared_mutex> lock(define_mutex_);
     auto it = metrics_.find(id);
     if (it == metrics_.end()) {
       return proxy_wasm::WasmResult::NotFound;
     }
     uint32_t type = it->second.type;
     if (type == 1) {  // Gauge
-      it->second.value = static_cast<int64_t>(value);
+      it->second.value.store(static_cast<int64_t>(value), std::memory_order_relaxed);
     } else {
       // Counter or Histogram: accumulate.
-      it->second.value += static_cast<int64_t>(value);
+      it->second.value.fetch_add(static_cast<int64_t>(value), std::memory_order_relaxed);
     }
     return proxy_wasm::WasmResult::Ok;
   }
 
   /**
    * Read the current metric value.
+   * Thread-safe: shared lock on define_mutex_ protects the map lookup;
+   * atomic load protects the value.
    */
   proxy_wasm::WasmResult get(uint32_t id, uint64_t *value_out) const {
+    std::shared_lock<std::shared_mutex> lock(define_mutex_);
     auto it = metrics_.find(id);
     if (it == metrics_.end()) {
       return proxy_wasm::WasmResult::NotFound;
     }
     if (value_out) {
-      *value_out = static_cast<uint64_t>(it->second.value);
+      *value_out = static_cast<uint64_t>(it->second.value.load(std::memory_order_relaxed));
     }
     return proxy_wasm::WasmResult::Ok;
   }
@@ -575,8 +733,13 @@ private:
   uint32_t next_counter_id_   = 0;  // Counter   type = 0
   uint32_t next_gauge_id_     = 1;  // Gauge     type = 1
   uint32_t next_histogram_id_ = 2;  // Histogram type = 2
+  mutable std::shared_mutex define_mutex_;  // Protects metrics_ map: unique lock in define(), shared lock in read methods
 };
 
+/**
+ * LsWasm - Custom WasmBase for lswasm.
+ * Overrides context creation to use LsWasmContext.
+ */
 class LsWasm : public proxy_wasm::WasmBase {
 public:
   LsWasm(std::unique_ptr<proxy_wasm::WasmVm> wasm_vm,
@@ -584,7 +747,16 @@ public:
          std::string_view vm_id = "", std::string_view vm_configuration = "",
          std::string_view vm_key = "")
       : proxy_wasm::WasmBase(std::move(wasm_vm), vm_id, vm_configuration, vm_key,
-                              std::move(envs), {}) {}
+                              std::move(envs), {}),
+        metrics_(std::make_shared<MetricStore>()) {}
+
+  // Clone constructor: creates a thread-local VM clone that shares the
+  // MetricStore with the base VM.  Uses the WasmBase(base_handle, factory)
+  // constructor which internally calls WasmVm::clone().
+  LsWasm(const std::shared_ptr<proxy_wasm::WasmHandleBase> &base_handle,
+         const proxy_wasm::WasmVmFactory &factory)
+      : proxy_wasm::WasmBase(base_handle, factory),
+        metrics_(std::dynamic_pointer_cast<LsWasm>(base_handle->wasm())->sharedMetrics()) {}
 
   proxy_wasm::ContextBase *createVmContext() override { return new LsWasmContext(this); }
 
@@ -598,12 +770,15 @@ public:
     return new LsWasmContext(this, plugin);
   }
 
-  /** Per-module metric store shared by all contexts. */
-  MetricStore &metrics() { return metrics_; }
-  const MetricStore &metrics() const { return metrics_; }
+  /** Per-module metric store shared by all contexts (including thread-local clones). */
+  MetricStore &metrics() { return *metrics_; }
+  const MetricStore &metrics() const { return *metrics_; }
+
+  /** Shared pointer to the metric store — used when creating clones. */
+  std::shared_ptr<MetricStore> sharedMetrics() { return metrics_; }
 
 private:
-  MetricStore metrics_;
+  std::shared_ptr<MetricStore> metrics_;
 };
 
 // ---- Out-of-line LsWasmContext metric methods (need LsWasm definition) ----
@@ -637,16 +812,168 @@ inline proxy_wasm::WasmResult LsWasmContext::getMetric(uint32_t metric_id, uint6
   return lw->metrics().get(metric_id, value_ptr);
 }
 
+// ---- WasmHandleBase / PluginHandleBase subclasses for thread-local cloning ----
+
+/**
+ * LsWasmHandle - WasmHandleBase subclass for lswasm.
+ * Required by the proxy-wasm createWasm() / getOrCreateThreadLocalPlugin() API.
+ */
+class LsWasmHandle : public proxy_wasm::WasmHandleBase {
+public:
+  explicit LsWasmHandle(std::shared_ptr<proxy_wasm::WasmBase> wasm_base)
+      : proxy_wasm::WasmHandleBase(std::move(wasm_base)) {}
+};
+
+/**
+ * LsPluginHandle - PluginHandleBase subclass for lswasm.
+ * Required by the proxy-wasm getOrCreateThreadLocalPlugin() API.
+ */
+class LsPluginHandle : public proxy_wasm::PluginHandleBase {
+public:
+  LsPluginHandle(std::shared_ptr<proxy_wasm::WasmHandleBase> wasm_handle,
+                 std::shared_ptr<proxy_wasm::PluginBase> plugin)
+      : proxy_wasm::PluginHandleBase(std::move(wasm_handle), std::move(plugin)) {}
+};
+
 } // namespace lswasm
 
 /**
  * WasmModuleManager - Manages loading and execution of WASM modules
- * using the proxy-wasm-cpp-host library with Wasmtime runtime.
+ * using the proxy-wasm-cpp-host library.
+ *
+ * Thread safety:
+ *   - modules_ map is protected by modules_mutex_ (shared_mutex).
+ *   - Request processing uses thread-local VM clones via
+ *     getOrCreateThreadLocalPlugin() — no per-request locking needed.
+ *   - Module load/unload takes a write lock; request processing takes a read lock.
  */
 class WasmModuleManager {
 public:
   WasmModuleManager() = default;
   ~WasmModuleManager() = default;
+
+  /**
+   * Per-module state.  After loadModule(), all fields are read-only
+   * except that thread-local VM clones are created on demand.
+   */
+  struct ModuleState {
+    std::shared_ptr<proxy_wasm::WasmHandleBase> base_handle;  // base VM (read-only after load)
+    std::shared_ptr<proxy_wasm::PluginBase> plugin;            // plugin config (read-only)
+    proxy_wasm::WasmHandleCloneFactory clone_factory;          // creates thread-local VM clones
+    proxy_wasm::PluginHandleFactory plugin_factory;            // creates thread-local plugin handles
+  };
+
+  /**
+   * RequestScope - Owns a stream context for one request's lifetime.
+   *
+   * Calls getOrCreateThreadLocalPlugin() to obtain a per-thread VM clone,
+   * then creates a stream context on that clone.  Each worker thread gets
+   * its own VM instance — no locking needed on VM state.
+   *
+   * RAII: the destructor calls onDone() and onDelete() to properly tear
+   * down the WASM stream context.
+   */
+  class RequestScope {
+  public:
+    /**
+     * Create a request scope for the given module.
+     * @param state  Module state (from the loaded modules map).
+     * @param context_id  Unique context ID for this request.
+     * @return true if the scope was successfully created, false on failure.
+     */
+    bool init(const ModuleState &state, uint32_t context_id) {
+      // Obtain (or create) a thread-local VM clone + plugin context.
+      plugin_handle_ = proxy_wasm::getOrCreateThreadLocalPlugin(
+          state.base_handle, state.plugin,
+          state.clone_factory, state.plugin_factory);
+      if (!plugin_handle_) {
+        LOG_ERROR("[RequestScope] Failed to get thread-local plugin for context "
+                  << context_id);
+        return false;
+      }
+
+      proxy_wasm::WasmBase *wasm = plugin_handle_->wasm().get();
+      if (!wasm || wasm->isFailed()) {
+        LOG_ERROR("[RequestScope] Thread-local VM not available for context "
+                  << context_id);
+        return false;
+      }
+
+      // Get the root context for this plugin on the thread-local VM.
+      proxy_wasm::ContextBase *root_ctx = wasm->getRootContext(state.plugin, false);
+      if (!root_ctx) {
+        LOG_ERROR("[RequestScope] No root context for context " << context_id);
+        return false;
+      }
+
+      // Create a stream context via createContext.
+      proxy_wasm::ContextBase *ctx = wasm->createContext(state.plugin);
+      if (!ctx) {
+        LOG_ERROR("[RequestScope] Failed to create stream context for context "
+                  << context_id);
+        return false;
+      }
+
+      ctx_ = dynamic_cast<lswasm::LsWasmContext *>(ctx);
+      if (!ctx_) {
+        LOG_ERROR("[RequestScope] Dynamic cast to LsWasmContext failed");
+        return false;
+      }
+
+      // Fix up the parent context (same as the old ensureStreamContext).
+      ctx_->setParentContext(root_ctx);
+      ctx_->onCreate();
+      ctx_->resetLocalResponse();
+      ctx_->resetHeaderMaps();
+      context_id_ = context_id;
+      return true;
+    }
+
+    ~RequestScope() {
+      if (ctx_) {
+        ctx_->onDone();
+        ctx_->onDelete();
+      }
+    }
+
+    // Non-copyable, but movable (to allow storage in containers).
+    RequestScope() = default;
+    RequestScope(const RequestScope &) = delete;
+    RequestScope &operator=(const RequestScope &) = delete;
+    RequestScope(RequestScope &&other) noexcept
+        : ctx_(other.ctx_), plugin_handle_(std::move(other.plugin_handle_)),
+          context_id_(other.context_id_) {
+      other.ctx_ = nullptr;
+      other.context_id_ = 0;
+    }
+    RequestScope &operator=(RequestScope &&other) noexcept {
+      if (this != &other) {
+        // Clean up existing context if any.
+        if (ctx_) {
+          ctx_->onDone();
+          ctx_->onDelete();
+        }
+        ctx_ = other.ctx_;
+        plugin_handle_ = std::move(other.plugin_handle_);
+        context_id_ = other.context_id_;
+        other.ctx_ = nullptr;
+        other.context_id_ = 0;
+      }
+      return *this;
+    }
+
+    /** The stream context for this request (nullptr if init() failed). */
+    lswasm::LsWasmContext *context() { return ctx_; }
+    const lswasm::LsWasmContext *context() const { return ctx_; }
+
+    /** Check if the scope was successfully initialized. */
+    bool valid() const { return ctx_ != nullptr; }
+
+  private:
+    lswasm::LsWasmContext *ctx_ = nullptr;
+    std::shared_ptr<proxy_wasm::PluginHandleBase> plugin_handle_;
+    uint32_t context_id_ = 0;
+  };
 
   /**
    * Set environment variables to pass to WASM modules via WASI environ_get.
@@ -657,117 +984,49 @@ public:
   }
 
   /**
-   * Load a WASM module from file
-   * @param module_path Path to the .wasm file
-   * @param module_name Unique identifier for the module
-   * @return true if successfully loaded
+   * Load a WASM module from file.
+   * Thread-safe: takes a write lock on modules_mutex_.
    */
   bool loadModule(const std::string &module_path, const std::string &module_name);
 
   /**
-   * Load a WASM module from memory
-   * @param code WASM bytecode
-   * @param code_size Size of bytecode
-   * @param module_name Unique identifier for the module
-   * @return true if successfully loaded
+   * Load a WASM module from memory.
+   * Thread-safe: takes a write lock on modules_mutex_.
    */
   bool loadModuleFromMemory(const uint8_t *code, size_t code_size,
                             const std::string &module_name);
 
   /**
-   * Execute module filter on HTTP request/response.
-   * Calls the appropriate proxy_on_* function in the WASM module.
-   * @param module_name Name of the module to execute
-   * @param context_id Context identifier
-   * @param phase Filter phase (onRequestHeaders, onResponseHeaders, etc.)
-   * @return true if execution successful
+   * Create a RequestScope for the named module.
+   * Thread-safe: takes a read lock on modules_mutex_.
+   * @param module_name  Name of the loaded module.
+   * @param context_id   Unique context ID for this request.
+   * @param scope        Output: the initialized RequestScope.
+   * @return true if the scope was successfully created.
    */
-  /**
-   * Ensure a stream context exists for the given module and context_id.
-   * Creates one (via proxy_on_context_create) if it doesn't already exist.
-   * Must be called before setContextHeaders() so headers can be populated
-   * before the filter phase executes.
-   */
-  bool ensureStreamContext(const std::string &module_name, uint32_t context_id);
-
-  bool executeFilter(const std::string &module_name, uint32_t context_id,
-                     const std::string &phase);
+  bool createRequestScope(const std::string &module_name, uint32_t context_id,
+                          RequestScope &scope) const;
 
   /**
-   * Get the local response body captured from the last sendLocalResponse call.
-   * @param module_name Name of the module
-   * @return the response body, or empty string if none
-   */
-  std::string getLocalResponseBody(const std::string &module_name) const;
-
-  /**
-   * Get the local response code captured from the last sendLocalResponse call.
-   * @param module_name Name of the module
-   * @return the response code, or 0 if none
-   */
-  uint32_t getLocalResponseCode(const std::string &module_name) const;
-
-  /**
-   * Check if a module has a pending local response.
-   * @param module_name Name of the module
-   * @return true if there is a pending local response
-   */
-  bool hasLocalResponse(const std::string &module_name) const;
-
-  /**
-   * Get the additional headers from the last sendLocalResponse call.
-   * @param module_name Name of the module
-   * @return the additional headers, or empty vector if none
-   */
-  HeaderPairs getLocalResponseHeaders(const std::string &module_name) const;
-
-  /**
-   * Set a header map on the module's stream context before filter execution.
-   * @param module_name Name of the module
-   * @param type Header map type (RequestHeaders, ResponseHeaders, etc.)
-   * @param pairs Header key-value pairs (owned strings)
-   */
-  void setContextHeaders(const std::string &module_name, proxy_wasm::WasmHeaderMapType type,
-                         const HeaderPairs &pairs);
-
-  /**
-   * Get a header map from the module's stream context after filter execution.
-   * @param module_name Name of the module
-   * @param type Header map type (RequestHeaders, ResponseHeaders, etc.)
-   * @return Header key-value pairs (owned strings)
-   */
-  HeaderPairs getContextHeaders(const std::string &module_name,
-                                proxy_wasm::WasmHeaderMapType type) const;
-
-  /**
-   * Unload a module
-   * @param module_name Name of the module to unload
-   * @return true if successfully unloaded
+   * Unload a module.
+   * Thread-safe: takes a write lock on modules_mutex_.
    */
   bool unloadModule(const std::string &module_name);
 
   /**
-   * Get list of loaded modules
-   * @return List of module names
+   * Get list of loaded module names.
+   * Thread-safe: takes a read lock on modules_mutex_.
    */
   std::vector<std::string> getLoadedModules() const;
 
   /**
-   * Check if module is loaded
-   * @param module_name Name of the module
-   * @return true if module is loaded
+   * Check if module is loaded.
+   * Thread-safe: takes a read lock on modules_mutex_.
    */
   bool hasModule(const std::string &module_name) const;
 
 private:
-  struct ModuleState {
-    std::shared_ptr<lswasm::LsWasm> wasm;
-    std::shared_ptr<proxy_wasm::PluginBase> plugin;
-    // The stream context used for the current request
-    lswasm::LsWasmContext *stream_context = nullptr;
-    uint32_t stream_context_id = 0;
-  };
-
+  mutable std::shared_mutex modules_mutex_;
   std::map<std::string, ModuleState> modules_;
   std::unordered_map<std::string, std::string> envs_;
 };

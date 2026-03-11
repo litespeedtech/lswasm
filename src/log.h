@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -37,9 +38,10 @@ inline constexpr const char *DOLOG_PATH = "/tmp/lswasm.dolog";
 inline constexpr const char *LOG_PATH = "/tmp/lswasm.log";
 
 // Global state — header-only, guarded by inline variables (C++17).
-// NOTE: Not thread-safe.  If multi-threading is added, protect with a mutex.
+// Thread-safe: g_log_mutex serializes writes to g_log_file.
 inline bool g_logging_enabled = false;
 inline std::ofstream g_log_file;
+inline std::mutex g_log_mutex;
 
 /**
  * Initialize the logging subsystem.
@@ -97,6 +99,7 @@ inline std::string timestamp() {
  */
 inline void log_info(const std::string &msg) {
   if (g_logging_enabled && g_log_file.is_open()) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
     g_log_file << timestamp() << " " << msg << std::endl;
   }
 }
@@ -107,9 +110,12 @@ inline void log_info(const std::string &msg) {
  */
 inline void log_error(const std::string &msg) {
   std::string ts = timestamp();
-  std::cerr << ts << " " << msg << std::endl;
-  if (g_logging_enabled && g_log_file.is_open()) {
-    g_log_file << ts << " " << msg << std::endl;
+  {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    std::cerr << ts << " " << msg << std::endl;
+    if (g_logging_enabled && g_log_file.is_open()) {
+      g_log_file << ts << " " << msg << std::endl;
+    }
   }
 }
 
@@ -118,13 +124,20 @@ inline void log_error(const std::string &msg) {
 // Convenience macros for stream-style logging.
 // Usage:  LOG_INFO("Loading module: " << name << " (" << size << " bytes)");
 //         LOG_ERROR("Failed to open: " << path);
+//
+// LOG_INFO is a no-op (zero overhead) when logging is disabled.  The
+// branch is predicted-not-taken at runtime and the compiler can elide the
+// entire ostringstream allocation in the common disabled case.
 #define LOG_INFO(expr) \
   do { \
-    std::ostringstream _lswasm_oss; \
-    _lswasm_oss << expr; \
-    lswasm_log::log_info(_lswasm_oss.str()); \
+    if (lswasm_log::g_logging_enabled) { \
+      std::ostringstream _lswasm_oss; \
+      _lswasm_oss << expr; \
+      lswasm_log::log_info(_lswasm_oss.str()); \
+    } \
   } while (0)
 
+// LOG_ERROR always writes to stderr; the ostringstream is always constructed.
 #define LOG_ERROR(expr) \
   do { \
     std::ostringstream _lswasm_oss; \

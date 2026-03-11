@@ -42,14 +42,14 @@ cd ..
 
 Assuming the path to the WASI SDK is (as above): 
 ```bash
-mkdir samples/build
-cmake -S samples -B samples/build \
+mkdir samples/sample_filter/build
+cmake -S samples/sample_filter -B samples/sample_filter/build \
     -DCMAKE_TOOLCHAIN_FILE=$HOME/lswasm/cmake/wasm32-wasi-toolchain.cmake \
     -DWASI_SDK_PATH=third_party/wasi-sdk-29.0-x86_64-linux
-cmake --build samples/build
+cmake --build samples/sample_filter/build
 ```
 
-The resulting `sample_filter.wasm` is written to `samples/build/`.
+The resulting `sample_filter.wasm` is written to `samples/sample_filter/build/`.
 
 You can also set the `WASI_SDK_PATH` environment variable instead of
 passing it as a CMake cache variable.
@@ -60,11 +60,11 @@ Pass `-DCMAKE_BUILD_TYPE=Debug` to produce an unstripped, unoptimised
 WASM module suitable for debugging with Chrome DevTools or `wasm-gdb`:
 
 ```bash
-cmake -S samples -B samples/build-debug \
+cmake -S samples/sample_filter -B samples/sample_filter/build-debug \
   -DCMAKE_TOOLCHAIN_FILE=cmake/wasm32-wasi-toolchain.cmake \
   -DWASI_SDK_PATH=/path/to/wasi-sdk-29.0 \
   -DCMAKE_BUILD_TYPE=Debug
-cmake --build samples/build-debug
+cmake --build samples/sample_filter/build-debug
 ```
 
 ### Without a toolchain file
@@ -73,9 +73,9 @@ The `CMakeLists.txt` includes a fallback that configures the WASI SDK
 inline if no toolchain file is provided:
 
 ```bash
-cmake -S samples -B samples/build \
+cmake -S samples/sample_filter -B samples/sample_filter/build \
   -DWASI_SDK_PATH=/path/to/wasi-sdk-29.0
-cmake --build samples/build
+cmake --build samples/sample_filter/build
 ```
 
 ### Manual one-liner
@@ -87,7 +87,7 @@ $WASI_SDK/bin/clang++ --target=wasm32-wasi -O2 -std=c++17 \
   -fvisibility=hidden -fno-exceptions -fno-rtti \
   -I third_party/proxy-wasm-cpp-sdk \
   third_party/proxy-wasm-cpp-sdk/proxy_wasm_intrinsics.cc \
-  samples/sample_filter.cpp \
+  samples/sample_filter/sample_filter.cpp \
   -mexec-model=reactor \
   -Wl,--export=memory -Wl,--export=malloc -Wl,--export=free \
   -Wl,--export=proxy_abi_version_0_2_1 \
@@ -101,7 +101,7 @@ $WASI_SDK/bin/clang++ --target=wasm32-wasi -O2 -std=c++17 \
   -Wl,--export=proxy_on_log \
   -Wl,--export=proxy_on_delete \
   -Wl,--strip-all -Wl,--allow-undefined \
-  -o samples/sample_filter.wasm
+  -o samples/sample_filter/sample_filter.wasm
 ```
 
 > **Note:** `-mexec-model=reactor` replaces the old `-Wl,--no-entry -Wl,--export-all`
@@ -112,7 +112,7 @@ $WASI_SDK/bin/clang++ --target=wasm32-wasi -O2 -std=c++17 \
 ## Usage with lswasm
 
 ```bash
-./build/lswasm --module samples/sample_filter.wasm
+./build/lswasm --module samples/sample_filter/sample_filter.wasm
 ```
 
 Then send a request (via the default Unix domain socket):

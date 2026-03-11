@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.16)
 # ---------------------------------------------------------------------------
 # This file expects to be configured with the wasm32-wasi toolchain file:
 #
-#   cmake -S samples -B samples/build \
+#   cmake -S samples/send_recv_all -B samples/send_recv_all/build \
 #     -DCMAKE_TOOLCHAIN_FILE=cmake/wasm32-wasi-toolchain.cmake \
 #     -DWASI_SDK_PATH=/path/to/wasi-sdk-29.0
 #
@@ -53,7 +53,7 @@ endif()
 # ---------------------------------------------------------------------------
 # proxy-wasm-cpp-sdk — header-only API plus one .cc runtime glue file.
 # ---------------------------------------------------------------------------
-set(PROXY_WASM_CPP_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/proxy-wasm-cpp-sdk"
+set(PROXY_WASM_CPP_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/proxy-wasm-cpp-sdk"
     CACHE PATH "Path to the proxy-wasm-cpp-sdk directory")
 
 if(NOT EXISTS "${PROXY_WASM_CPP_SDK}/proxy_wasm_intrinsics.h")
@@ -63,27 +63,27 @@ if(NOT EXISTS "${PROXY_WASM_CPP_SDK}/proxy_wasm_intrinsics.h")
     "  git submodule update --init --recursive")
 endif()
 
-project(sample_filter_wasm CXX)
+project(send_recv_all_wasm CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
-# Build target — sample_filter.wasm
+# Build target — send_recv_all.wasm
 # ---------------------------------------------------------------------------
-add_executable(sample_filter
-  sample_filter.cpp
+add_executable(send_recv_all
+  send_recv_all.cpp
   ${PROXY_WASM_CPP_SDK}/proxy_wasm_intrinsics.cc
 )
 
-target_include_directories(sample_filter PRIVATE
+target_include_directories(send_recv_all PRIVATE
   ${PROXY_WASM_CPP_SDK}
 )
 
 # Compile flags for wasm32-wasi module.
 # The target triple and sysroot are handled by the toolchain / CMAKE_SYSROOT;
 # only WASM-specific flags are listed here.
-target_compile_options(sample_filter PRIVATE
+target_compile_options(send_recv_all PRIVATE
   -fvisibility=hidden
   -fno-exceptions
   -fno-rtti
@@ -140,7 +140,7 @@ endforeach()
 # Link as a WASI reactor — only the symbols listed above are exported.
 # --allow-undefined permits unresolved host-provided imports (proxy_log, etc.)
 # that will be satisfied at runtime by the proxy-wasm host.
-target_link_options(sample_filter PRIVATE
+target_link_options(send_recv_all PRIVATE
   -mexec-model=reactor
   -Wl,--allow-undefined
   $<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-Wl,--strip-all>
@@ -148,11 +148,11 @@ target_link_options(sample_filter PRIVATE
 )
 
 # Produce a .wasm file instead of a native binary.
-set_target_properties(sample_filter PROPERTIES SUFFIX ".wasm")
+set_target_properties(send_recv_all PROPERTIES SUFFIX ".wasm")
 
 message(STATUS "WASI SDK:           ${WASI_SDK_PATH}")
 message(STATUS "CMAKE_SYSROOT:      ${CMAKE_SYSROOT}")
 message(STATUS "proxy-wasm-cpp-sdk: ${PROXY_WASM_CPP_SDK}")
 message(STATUS "CXX compiler:       ${CMAKE_CXX_COMPILER}")
 message(STATUS "Build type:         ${CMAKE_BUILD_TYPE}")
-message(STATUS "Configured sample_filter.wasm target (proxy-wasm 0.2.1 ABI, SDK-based)")
+message(STATUS "Configured send_recv_all.wasm target (proxy-wasm 0.2.1 ABI, SDK-based)")
