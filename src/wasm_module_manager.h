@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -485,11 +486,15 @@ public:
       LOG_ERROR("[Streaming] headers already sent");
       return proxy_wasm::WasmResult::BadArgument;
     }
-    std::string hdr_str = http_utils::serialize_headers(status_code, headers);
+    // Inject Transfer-Encoding: chunked so HTTP/1.1 clients can detect
+    // end-of-body without Content-Length.
+    HeaderPairs augmented(headers);
+    augmented.emplace_back("Transfer-Encoding", "chunked");
+    std::string hdr_str = http_utils::serialize_headers(status_code, augmented);
     conn_->writeData(std::move(hdr_str));
     streaming_state_ = StreamingResponseState::HeadersSent;
     LOG_INFO("[Streaming] sent headers: status=" << status_code
-             << " header_count=" << headers.size());
+             << " header_count=" << augmented.size());
     return proxy_wasm::WasmResult::Ok;
   }
 
@@ -506,10 +511,19 @@ public:
       return proxy_wasm::WasmResult::BadArgument;
     }
     if (!data.empty()) {
-      // Copy the data into a std::string because writeData() blocks until
-      // the epoll loop drains the buffer, and the WASM linear memory
-      // backing this string_view may not remain valid across that wait.
-      conn_->writeData(std::string(data.data(), data.size()));
+      // Wrap data in HTTP/1.1 chunked transfer encoding:
+      //   <hex-size>\r\n<data>\r\n
+      // The data is copied because writeData() blocks until the epoll loop
+      // drains the buffer, and the WASM linear memory backing this
+      // string_view may not remain valid across that wait.
+      char size_buf[24];
+      int n = std::snprintf(size_buf, sizeof(size_buf), "%zx\r\n", data.size());
+      std::string chunk;
+      chunk.reserve(static_cast<size_t>(n) + data.size() + 2);
+      chunk.append(size_buf, static_cast<size_t>(n));
+      chunk.append(data.data(), data.size());
+      chunk.append("\r\n");
+      conn_->writeData(std::move(chunk));
     }
     return proxy_wasm::WasmResult::Ok;
   }
@@ -525,6 +539,8 @@ public:
                 << static_cast<int>(streaming_state_) << ")");
       return proxy_wasm::WasmResult::BadArgument;
     }
+    // Send the chunked transfer encoding terminator: zero-length chunk.
+    conn_->writeData(std::string("0\r\n\r\n"));
     streaming_state_ = StreamingResponseState::Finished;
     // Do NOT call conn_->finish() here — the host's handle_request()
     // owns the lifecycle and will call finish() after the filter chain

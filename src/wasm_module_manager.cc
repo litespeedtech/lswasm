@@ -159,17 +159,39 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     };
 
     // WasmHandleCloneFactory: creates a thread-local VM clone from a base handle.
-    // Each clone gets its own V8 Store/Isolate (via WasmVm::clone()) and shares
+    // Each clone gets its own VM instance (via WasmVm::clone() for cloneable
+    // runtimes, or a fresh VM via the factory for non-cloneable ones) and shares
     // the MetricStore with the base VM.
     //
     // The LsWasm clone constructor delegates to WasmBase(base_handle, factory)
-    // which internally calls WasmVm::clone(), then getOrCreateThreadLocalWasm()
-    // calls load() + initialize() after the clone factory returns.
+    // which internally calls WasmVm::clone() for cloneable runtimes (Wasmtime,
+    // V8, WAMR) or factory() for non-cloneable runtimes (WasmEdge).
+    // After the clone factory returns, getOrCreateThreadLocalWasm() calls
+    // load() + initialize() on the new VM.
     proxy_wasm::WasmHandleCloneFactory clone_factory =
         [](std::shared_ptr<proxy_wasm::WasmHandleBase> base_handle)
             -> std::shared_ptr<proxy_wasm::WasmHandleBase> {
+      // Provide a WasmVmFactory for non-cloneable runtimes (e.g. WasmEdge).
+      // Cloneable runtimes (Wasmtime, V8, WAMR) use WasmVm::clone() and
+      // never invoke this factory.
+      proxy_wasm::WasmVmFactory vm_factory = []() -> std::unique_ptr<proxy_wasm::WasmVm> {
+#if defined(WASM_RUNTIME_WASMTIME)
+        auto vm = proxy_wasm::createWasmtimeVm();
+#elif defined(WASM_RUNTIME_V8)
+        auto vm = proxy_wasm::createV8Vm();
+#elif defined(WASM_RUNTIME_WASMEDGE)
+        auto vm = proxy_wasm::createWasmEdgeVm();
+#elif defined(WASM_RUNTIME_WAMR)
+        auto vm = proxy_wasm::createWamrVm();
+#else
+        LOG_ERROR("No WASM runtime available for clone factory");
+        return nullptr;
+#endif
+        vm->integration() = std::make_unique<lswasm::LsWasmIntegration>();
+        return vm;
+      };
       auto cloned_wasm = std::make_shared<lswasm::LsWasm>(
-          base_handle, /*factory=*/nullptr);
+          base_handle, vm_factory);
       return std::make_shared<lswasm::LsWasmHandle>(std::move(cloned_wasm));
     };
 

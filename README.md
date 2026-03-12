@@ -28,6 +28,7 @@ lswasm/
 ├── README.md                       # This file
 ├── .gitmodules                     # Git submodule configuration
 ├── install.sh                      # Install lswasm as a systemd user service
+├── upgrade.sh                      # Automated upgrade (pull, build, restart)
 ├── uninstall.sh                    # Remove service and installed binary
 ├── src/
 │   ├── main.cpp                    # HTTP server (epoll loop, CLI, thread pool dispatch)
@@ -309,19 +310,53 @@ cmake --build . -j$(nproc)
 
 To upgrade an existing lswasm installation to a newer version:
 
-### 1. Check the Changelog
+### Automated Upgrade (Recommended)
+
+If lswasm was installed via `install.sh`, the `upgrade.sh` script automates
+the entire process — pull, submodule update, clean rebuild, stop service,
+copy binary, and restart:
+
+```bash
+cd lswasm
+./upgrade.sh
+```
+
+Pass CMake options with `--cmake-args`:
+
+```bash
+./upgrade.sh --cmake-args "-DWASM_RUNTIME=wamr -DCMAKE_BUILD_TYPE=Release"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--build-dir <path>` | Build directory (default: `build`) |
+| `--cmake-args <args>` | Additional CMake configure arguments (quoted string, e.g., `"-DWASM_RUNTIME=wamr -DCMAKE_BUILD_TYPE=Release"`) |
+| `--no-clean` | Incremental build instead of clean rebuild |
+| `--no-pull` | Skip `git pull` (use local source as-is) |
+| `--service-name <name>` | Override the systemd unit name |
+
+### Re-installing with install.sh
+
+You can also re-run `install.sh` with the same arguments as the original
+install.  If an existing binary is detected at the install location, the
+script automatically stops the running service before copying the new binary
+and restarts it afterward.
+
+### Manual Upgrade
+
+#### 1. Check the Changelog
 
 Review [CHANGES.md](CHANGES.md) for breaking changes, new features, and
 migration notes before upgrading.
 
-### 2. Pull Latest Changes
+#### 2. Pull Latest Changes
 
 ```bash
 cd lswasm
 git pull
 ```
 
-### 3. Update Submodules
+#### 3. Update Submodules
 
 The `proxy-wasm-cpp-host` submodule may have been updated. Always sync and
 update submodules after pulling:
@@ -331,7 +366,7 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-### 4. Rebuild
+#### 4. Rebuild
 
 A clean rebuild is recommended after upgrading, especially when submodules
 or build configuration have changed:
@@ -367,8 +402,11 @@ cmake --build . -j$(nproc)
 ### Basic Usage
 
 ```bash
-./lswasm
+./lswasm --module samples/sample_filter/sample_filter.wasm
 ```
+
+The `--module` flag is **required** — lswasm will exit with an error if no
+WASM filter module is specified.
 
 By default, lswasm listens on a Unix domain socket at `/tmp/lswasm.sock`
 using `std::thread::hardware_concurrency()` worker threads (or 4 if
@@ -378,28 +416,22 @@ detection fails).
 
 ```bash
 # Use 8 worker threads
-./lswasm --workers 8
+./lswasm --module filter.wasm --workers 8
 ```
 
 ### Custom TCP Port
 
 ```bash
-./lswasm --port 9000
+./lswasm --module filter.wasm --port 9000
 ```
 
 ### Custom Unix Domain Socket Path
 
 ```bash
-./lswasm --uds /var/run/lswasm.sock
+./lswasm --module filter.wasm --uds /var/run/lswasm.sock
 ```
 
 When both `--port` and `--uds` are given, only `--uds` is used.
-
-### Loading a WASM Filter Module
-
-```bash
-./lswasm --module samples/sample_filter/sample_filter.wasm
-```
 
 ### Passing Environment Variables to WASM Modules
 
@@ -420,7 +452,7 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 | `--port` | `PORT` | Listen on a TCP port instead of a Unix domain socket |
 | `--uds` | `PATH` | Listen on a Unix domain socket (default: `/tmp/lswasm.sock`) |
 | `--sock-perm` | `MODE` | Set UDS file permissions in octal (default: `0666`) |
-| `--module` | `PATH` | Load a WASM filter module |
+| `--module` | `PATH` | **(required)** Load a WASM filter module |
 | `--env` | `KEY=VALUE` | Set an environment variable for WASM modules (repeatable) |
 | `--workers` | `N` | Number of worker threads (default: `hardware_concurrency()` or 4) |
 | `--body-pacifier` | — | Include a diagnostic body in HTTP responses (request info, runtime, filters) |
@@ -559,7 +591,7 @@ Use `--port` to switch to TCP mode for direct `curl` testing.
 
 ```bash
 # Start with the default UDS listener:
-./lswasm
+./lswasm --module samples/sample_filter/sample_filter.wasm
 
 # In another terminal:
 curl --unix-socket /tmp/lswasm.sock http://localhost/
@@ -569,7 +601,7 @@ curl --unix-socket /tmp/lswasm.sock http://localhost/
 
 ```bash
 # Start with TCP listener:
-./lswasm --port 8080
+./lswasm --module samples/sample_filter/sample_filter.wasm --port 8080
 
 # In another terminal:
 curl http://localhost:8080/

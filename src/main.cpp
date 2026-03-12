@@ -1016,13 +1016,13 @@ int main(int argc, char *argv[]) {
         } else if (arg == "--help") {
             std::cout << "lswasm " << LSWASM_VERSION
                       << " — WASM HTTP Proxy Server with Proxy-WASM Support\n";
-            std::cout << "Usage: " << argv[0] << " [options]\n";
+            std::cout << "Usage: " << argv[0] << " --module <path> [options]\n";
             std::cout << "Options:\n";
             std::cout << "  --port PORT      : Listen on TCP port (instead of UDS)\n";
             std::cout << "  --uds PATH       : Listen on Unix domain socket (default: "
                       << DEFAULT_UDS_PATH << ")\n";
             std::cout << "  --sock-perm MODE : Set UDS file permissions in octal (default: 0666)\n";
-            std::cout << "  --module PATH    : Load WASM filter module\n";
+            std::cout << "  --module PATH    : Load WASM filter module (required)\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
             std::cout << "  --workers N      : Number of worker threads (default: hardware_concurrency)\n";
             std::cout << "  --body-pacifier  : Include diagnostic body in HTTP responses\n";
@@ -1071,8 +1071,13 @@ int main(int argc, char *argv[]) {
         g_module_manager->setEnvironmentVariables(wasm_envs);
     }
 
-    // Load WASM module if provided
-    if (!wasm_module_path.empty()) {
+    // Load WASM module (required).
+    if (wasm_module_path.empty()) {
+        LOG_ERROR("No WASM module specified. Use --module <path> to load a filter.");
+        std::cerr << "Error: --module is required. Run with --help for usage.\n";
+        return 1;
+    }
+    {
         std::string module_name = "custom_filter";
         LOG_INFO("Loading WASM filter module: " << wasm_module_path);
         if (g_module_manager->loadModule(wasm_module_path, module_name)) {

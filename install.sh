@@ -184,11 +184,26 @@ done
 
 # ── Install binary ──────────────────────────────────────────────────────
 INSTALLED_BIN="${INSTALL_DIR}/lswasm"
+IS_UPGRADE=false
+
+# Detect existing installation and stop the service before overwriting.
+if [[ -f "$INSTALLED_BIN" ]]; then
+  IS_UPGRADE=true
+  echo "Existing installation detected at $INSTALLED_BIN"
+  if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    echo "Stopping service $SERVICE_NAME..."
+    systemctl --user stop "$SERVICE_NAME"
+  fi
+fi
 
 mkdir -p "$INSTALL_DIR"
 cp "$BIN" "$INSTALLED_BIN"
 chmod 755 "$INSTALLED_BIN"
-echo "Installed binary to $INSTALLED_BIN"
+if $IS_UPGRADE; then
+  echo "Updated binary at $INSTALLED_BIN"
+else
+  echo "Installed binary to $INSTALLED_BIN"
+fi
 
 # ── Build ExecStart with safe quoting ────────────────────────────────────
 # printf %q produces bash-style quoting; systemd honours backslash-escaped

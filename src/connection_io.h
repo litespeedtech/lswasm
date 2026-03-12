@@ -78,14 +78,16 @@ public:
     /// Return the Content-Length value (0 if none).
     size_t contentLength() const { return content_length_; }
 
-    /// Read body data from the event loop.  Blocks until data is available
-    /// or end-of-stream.  Returns empty string on EOF or error.
+    /// Read body data from the event loop.  Blocks until at least
+    /// max_chunk bytes have accumulated or end-of-stream is reached.
+    /// Returns empty string on EOF or error.
     std::string readBodyChunk(size_t max_chunk) {
         std::unique_lock<std::mutex> lock(read_mutex_);
-        read_cv_.wait(lock, [this] {
-            return read_data_ready_ || read_eof_ || read_error_;
+        // Wait until the buffer has enough data or the stream ends.
+        read_cv_.wait(lock, [this, max_chunk] {
+            return read_chunk_.size() >= max_chunk || read_eof_ || read_error_;
         });
-        if (read_error_) return {};
+        if (read_error_ && read_chunk_.empty()) return {};
         if (read_chunk_.empty() && read_eof_) return {};
 
         std::string result;
