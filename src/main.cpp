@@ -748,7 +748,6 @@ private:
         size_t content_length = conn->contentLength();
         LOG_INFO("Request has Content-Length: " << content_length);
         if (content_length > 0) {
-            // Process any body bytes that arrived with the headers.
             const std::string &prefix = conn->bodyPrefix();
             size_t body_consumed = prefix.size();
             LOG_INFO("Prefix size: " << body_consumed);
@@ -757,20 +756,37 @@ private:
                 filter_ctx.onRequestBody(body_consumed >= content_length);
             }
 
-            // Read remaining body in chunks.
             LOG_INFO("Read: " << body_consumed << " / " << content_length);
-            while (body_consumed < content_length) {
+            while (body_consumed < content_length && !http_data.has_local_response) {
                 size_t want = std::min(content_length - body_consumed, BODY_CHUNK_SIZE);
-                std::string chunk = conn->readBodyChunk(want);
-                if (chunk.empty()) break;  // EOF or error
-                body_consumed += chunk.size();
-                http_data.request_body = std::move(chunk);
+                ConnectionIO::BodyReadResult read_result = conn->readBodyChunk(want);
+                if (read_result.status == ConnectionIO::BodyReadStatus::Error) {
+                    LOG_ERROR("[HTTP] Request body read error after " << body_consumed
+                              << " / " << content_length << " bytes");
+                    conn->setError();
+                    return;
+                }
+                if (read_result.status == ConnectionIO::BodyReadStatus::Truncated) {
+                    LOG_ERROR("[HTTP] Request body truncated after " << body_consumed
+                              << " / " << content_length << " bytes");
+                    conn->setError();
+                    return;
+                }
+                if (read_result.data.empty()) {
+                    LOG_ERROR("[HTTP] Request body read returned no data before completion");
+                    conn->setError();
+                    return;
+                }
+                body_consumed += read_result.data.size();
+                http_data.request_body = std::move(read_result.data);
                 LOG_INFO("Read: " << body_consumed << " / " << content_length);
                 filter_ctx.onRequestBody(body_consumed >= content_length);
             }
         }
 
-        filter_ctx.onRequestTrailers();
+        if (!http_data.has_local_response) {
+            filter_ctx.onRequestTrailers();
+        }
 
         // Check again after body processing.
         if (http_data.has_local_response) {
@@ -780,10 +796,14 @@ private:
             return;
         }
 
-        // If a streaming response was completed by the WASM filter,
-        // skip normal response generation — the data is already on
-        // the wire via ConnectionIO.
+        // Request-phase streaming responses must be fully finished before the
+        // host treats them as a terminal success path.
         if (filter_ctx.hasStreamingResponse()) {
+            if (!filter_ctx.isStreamingFinished()) {
+                LOG_ERROR("[HTTP] Streaming response started but was not finished");
+                conn->setError();
+                return;
+            }
             LOG_INFO("[HTTP] Streaming response handled by WASM filter.");
             filter_ctx.onDone();
             conn->finish();
@@ -791,9 +811,9 @@ private:
         }
 
         // Generate the response body.
-        std::string body;
+        http_data.response_body.clear();
         if (g_body_pacifier) {
-            body = build_response_body(http_data);
+            http_data.response_body = build_response_body(http_data);
         }
 
         // Populate default response headers.
@@ -801,11 +821,38 @@ private:
         http_data.response_headers.emplace_back("Content-Type", "text/plain");
         http_data.response_headers.emplace_back("Connection", "close");
 
-        // Execute response phases — WASM modules can modify response_headers.
+        // Execute response phases — WASM modules can modify response headers,
+        // response body bytes, or replace the response entirely.
         LOG_INFO("[HTTP] Processing response in filter chain...");
         filter_ctx.onResponseHeaders();
         filter_ctx.onResponseBody();
         filter_ctx.onResponseTrailers();
+
+        if (http_data.has_local_response) {
+            if (filter_ctx.hasStreamingResponse()) {
+                LOG_ERROR("[HTTP] Local response requested after streaming response started");
+                conn->setError();
+                return;
+            }
+            filter_ctx.onDone();
+            std::string response = build_local_response(http_data);
+            write_chunked(conn, response);
+            conn->finish();
+            return;
+        }
+
+        if (filter_ctx.hasStreamingResponse()) {
+            if (!filter_ctx.isStreamingFinished()) {
+                LOG_ERROR("[HTTP] Streaming response started but was not finished");
+                conn->setError();
+                return;
+            }
+            LOG_INFO("[HTTP] Streaming response handled by WASM filter.");
+            filter_ctx.onDone();
+            conn->finish();
+            return;
+        }
+
         filter_ctx.onDone();
 
         // Ensure Content-Length is correct after filter chain.
@@ -814,14 +861,14 @@ private:
             [](const std::pair<std::string, std::string> &p) {
                 return header_name_eq(p.first, "Content-Length");
             }), hdrs.end());
-        hdrs.emplace_back("Content-Length", std::to_string(body.length()));
+        hdrs.emplace_back("Content-Length", std::to_string(http_data.response_body.length()));
 
         // Write response headers.
         std::string hdr_str = http_utils::serialize_headers(200, hdrs);
         conn->writeData(hdr_str);
 
         // Write response body in chunks.
-        write_chunked(conn, body);
+        write_chunked(conn, http_data.response_body);
 
         conn->finish();
     }

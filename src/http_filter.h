@@ -192,18 +192,18 @@ public:
 
   void onResponseHeaders() {
     LOG_INFO("[Filter] onResponseHeaders called (context_id: " << context_id_ << ")");
+    const bool end_of_stream = http_data_->response_body.empty();
     for (const std::string &m : module_order_) {
       if (http_data_->has_local_response) break;
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
       auto *ctx = it->second.context();
-      // Push response headers into the WASM context before execution.
       ctx->setHeaderMap(
           proxy_wasm::WasmHeaderMapType::ResponseHeaders, http_data_->response_headers);
-      ctx->onResponseHeaders(0, true);
-      // Pull back any modifications the WASM module made to response headers.
+      ctx->onResponseHeaders(0, end_of_stream);
       http_data_->response_headers = ctx->getHeaderMapOwned(
           proxy_wasm::WasmHeaderMapType::ResponseHeaders);
+      checkLocalResponse(it->second, m);
     }
   }
 
@@ -213,7 +213,15 @@ public:
       if (http_data_->has_local_response) break;
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
-      it->second.context()->onResponseBody(0, true);
+      auto *ctx = it->second.context();
+      ctx->setHeaderMap(
+          proxy_wasm::WasmHeaderMapType::ResponseHeaders, http_data_->response_headers);
+      ctx->setResponseBody(http_data_->response_body);
+      ctx->setEndOfStream(true);
+      ctx->onResponseBody(http_data_->response_body.size(), true);
+      http_data_->response_headers = ctx->getHeaderMapOwned(
+          proxy_wasm::WasmHeaderMapType::ResponseHeaders);
+      checkLocalResponse(it->second, m);
     }
   }
 
@@ -223,7 +231,13 @@ public:
       if (http_data_->has_local_response) break;
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
-      it->second.context()->onResponseTrailers(0);
+      auto *ctx = it->second.context();
+      ctx->setHeaderMap(
+          proxy_wasm::WasmHeaderMapType::ResponseHeaders, http_data_->response_headers);
+      ctx->onResponseTrailers(0);
+      http_data_->response_headers = ctx->getHeaderMapOwned(
+          proxy_wasm::WasmHeaderMapType::ResponseHeaders);
+      checkLocalResponse(it->second, m);
     }
   }
 

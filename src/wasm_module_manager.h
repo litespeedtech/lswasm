@@ -486,15 +486,43 @@ public:
       LOG_ERROR("[Streaming] headers already sent");
       return proxy_wasm::WasmResult::BadArgument;
     }
-    // Inject Transfer-Encoding: chunked so HTTP/1.1 clients can detect
-    // end-of-body without Content-Length.
-    HeaderPairs augmented(headers);
-    augmented.emplace_back("Transfer-Encoding", "chunked");
-    std::string hdr_str = http_utils::serialize_headers(status_code, augmented);
+
+    HeaderPairs normalized;
+    normalized.reserve(headers.size() + 1);
+    bool saw_chunked = false;
+    bool saw_conflicting_transfer_encoding = false;
+    for (const auto &header : headers) {
+      if (header_name_eq(header.first, "Content-Length")) {
+        continue;
+      }
+      if (header_name_eq(header.first, "Transfer-Encoding")) {
+        std::string value_lower(header.second);
+        std::transform(value_lower.begin(), value_lower.end(), value_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (value_lower == "chunked") {
+          saw_chunked = true;
+          normalized.emplace_back(header.first, header.second);
+        } else {
+          saw_conflicting_transfer_encoding = true;
+        }
+        continue;
+      }
+      normalized.emplace_back(header.first, header.second);
+    }
+
+    if (saw_conflicting_transfer_encoding) {
+      LOG_ERROR("[Streaming] refusing conflicting Transfer-Encoding on chunked streaming response");
+      return proxy_wasm::WasmResult::BadArgument;
+    }
+    if (!saw_chunked) {
+      normalized.emplace_back("Transfer-Encoding", "chunked");
+    }
+
+    std::string hdr_str = http_utils::serialize_headers(status_code, normalized);
     conn_->writeData(std::move(hdr_str));
     streaming_state_ = StreamingResponseState::HeadersSent;
     LOG_INFO("[Streaming] sent headers: status=" << status_code
-             << " header_count=" << augmented.size());
+             << " header_count=" << normalized.size());
     return proxy_wasm::WasmResult::Ok;
   }
 

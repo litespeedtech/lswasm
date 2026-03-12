@@ -42,6 +42,18 @@
  */
 class ConnectionIO {
 public:
+    enum class BodyReadStatus {
+        Data,
+        Complete,
+        Truncated,
+        Error,
+    };
+
+    struct BodyReadResult {
+        std::string data;
+        BodyReadStatus status = BodyReadStatus::Data;
+    };
+
     explicit ConnectionIO(int fd, int event_fd)
         : fd_(fd), event_fd_(event_fd) {}
 
@@ -62,6 +74,9 @@ public:
         header_data_ = std::move(header_data);
         body_prefix_ = std::move(body_prefix);
         content_length_ = content_length;
+        if (body_prefix_.size() > content_length_) {
+            body_prefix_.resize(content_length_);
+        }
         body_bytes_fed_ = body_prefix_.size();
     }
 
@@ -78,17 +93,28 @@ public:
     /// Return the Content-Length value (0 if none).
     size_t contentLength() const { return content_length_; }
 
-    /// Read body data from the event loop.  Blocks until at least
-    /// max_chunk bytes have accumulated or end-of-stream is reached.
-    /// Returns empty string on EOF or error.
-    std::string readBodyChunk(size_t max_chunk) {
+    /// Read body data from the event loop. Blocks until at least max_chunk
+    /// bytes have accumulated or the request body reaches a terminal state.
+    /// The returned status distinguishes complete delivery from truncation
+    /// and read error.
+    BodyReadResult readBodyChunk(size_t max_chunk) {
         std::unique_lock<std::mutex> lock(read_mutex_);
-        // Wait until the buffer has enough data or the stream ends.
         read_cv_.wait(lock, [this, max_chunk] {
-            return read_chunk_.size() >= max_chunk || read_eof_ || read_error_;
+            return read_chunk_.size() >= max_chunk || bodyCompleteLocked() ||
+                   read_eof_ || read_error_;
         });
-        if (read_error_ && read_chunk_.empty()) return {};
-        if (read_chunk_.empty() && read_eof_) return {};
+
+        if (read_chunk_.empty()) {
+            if (bodyCompleteLocked()) {
+                return BodyReadResult{{}, BodyReadStatus::Complete};
+            }
+            if (read_error_) {
+                return BodyReadResult{{}, BodyReadStatus::Error};
+            }
+            if (read_eof_) {
+                return BodyReadResult{{}, BodyReadStatus::Truncated};
+            }
+        }
 
         std::string result;
         if (read_chunk_.size() <= max_chunk) {
@@ -98,10 +124,23 @@ public:
             result = read_chunk_.substr(0, max_chunk);
             read_chunk_.erase(0, max_chunk);
         }
+
         if (read_chunk_.empty()) {
             read_data_ready_ = false;
         }
-        return result;
+
+        BodyReadStatus status = BodyReadStatus::Data;
+        if (read_chunk_.empty()) {
+            if (bodyCompleteLocked()) {
+                status = BodyReadStatus::Complete;
+            } else if (read_error_) {
+                status = BodyReadStatus::Error;
+            } else if (read_eof_) {
+                status = BodyReadStatus::Truncated;
+            }
+        }
+
+        return BodyReadResult{std::move(result), status};
     }
 
     /// Enqueue response data for the event loop to write.
@@ -239,6 +278,10 @@ public:
     }
 
 private:
+    bool bodyCompleteLocked() const {
+        return body_bytes_fed_ >= content_length_;
+    }
+
     void signal_eventfd() {
         uint64_t val = 1;
         // Best-effort write — if it fails (e.g. would-block), the event
