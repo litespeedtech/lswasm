@@ -49,8 +49,8 @@
 #include "proxy-wasm/wamr.h"
 #endif
 
-// ConnectionIO is needed for the streaming response methods in LsWasmContext.
-#include "connection_io.h"
+// ResponseSink is used by the streaming response methods in LsWasmContext.
+#include "response_sink.h"
 
 // Streaming response state machine for LsWasmContext.
 enum class StreamingResponseState {
@@ -59,16 +59,7 @@ enum class StreamingResponseState {
   Finished       // Final chunk sent; response is complete.
 };
 
-// Case-insensitive comparison for HTTP header field names (RFC 7230 §3.2).
-inline bool header_name_eq(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(a[i])) !=
-        std::tolower(static_cast<unsigned char>(b[i])))
-      return false;
-  }
-  return true;
-}
+// header_name_eq() is now defined in http_utils.h (included above).
 
 namespace lswasm {
 
@@ -454,11 +445,11 @@ public:
 
   // ---- Streaming response API ----
   // These methods are called by the foreign-function handlers registered
-  // in main.cpp.  They delegate I/O to the ConnectionIO object that was
-  // injected via setConnectionIO().
+  // in main.cpp.  They delegate I/O to the ResponseSink injected via
+  // setResponseSink().
 
-  /// Inject the ConnectionIO for this request (called by HttpFilterContext).
-  void setConnectionIO(ConnectionIO *conn) { conn_ = conn; }
+  /// Inject the ResponseSink for this request (called by HttpFilterContext).
+  void setResponseSink(ResponseSink *sink) { sink_ = sink; }
 
   /// Current streaming state.
   StreamingResponseState streamingState() const { return streaming_state_; }
@@ -473,13 +464,13 @@ public:
     return streaming_state_ == StreamingResponseState::Finished;
   }
 
-  /// Send the HTTP response status line and headers via ConnectionIO.
+  /// Send the response status line and headers via the ResponseSink.
   /// Must be called exactly once before any streamingWriteChunk() calls.
   /// Returns Ok on success, or an error WasmResult.
   proxy_wasm::WasmResult streamingSendHeaders(uint32_t status_code,
                                               const HeaderPairs &headers) {
-    if (!conn_) {
-      LOG_ERROR("[Streaming] no ConnectionIO — cannot send headers");
+    if (!sink_) {
+      LOG_ERROR("[Streaming] no ResponseSink — cannot send headers");
       return proxy_wasm::WasmResult::InternalFailure;
     }
     if (streaming_state_ != StreamingResponseState::Idle) {
@@ -487,50 +478,21 @@ public:
       return proxy_wasm::WasmResult::BadArgument;
     }
 
-    HeaderPairs normalized;
-    normalized.reserve(headers.size() + 1);
-    bool saw_chunked = false;
-    bool saw_conflicting_transfer_encoding = false;
-    for (const auto &header : headers) {
-      if (header_name_eq(header.first, "Content-Length")) {
-        continue;
-      }
-      if (header_name_eq(header.first, "Transfer-Encoding")) {
-        std::string value_lower(header.second);
-        std::transform(value_lower.begin(), value_lower.end(), value_lower.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (value_lower == "chunked") {
-          saw_chunked = true;
-          normalized.emplace_back(header.first, header.second);
-        } else {
-          saw_conflicting_transfer_encoding = true;
-        }
-        continue;
-      }
-      normalized.emplace_back(header.first, header.second);
+    if (!sink_->sendHeaders(status_code, headers, /*streaming=*/true)) {
+      LOG_ERROR("[Streaming] sendHeaders failed");
+      return proxy_wasm::WasmResult::InternalFailure;
     }
-
-    if (saw_conflicting_transfer_encoding) {
-      LOG_ERROR("[Streaming] refusing conflicting Transfer-Encoding on chunked streaming response");
-      return proxy_wasm::WasmResult::BadArgument;
-    }
-    if (!saw_chunked) {
-      normalized.emplace_back("Transfer-Encoding", "chunked");
-    }
-
-    std::string hdr_str = http_utils::serialize_headers(status_code, normalized);
-    conn_->writeData(std::move(hdr_str));
     streaming_state_ = StreamingResponseState::HeadersSent;
     LOG_INFO("[Streaming] sent headers: status=" << status_code
-             << " header_count=" << normalized.size());
+             << " header_count=" << headers.size());
     return proxy_wasm::WasmResult::Ok;
   }
 
   /// Write a chunk of body data.  May be called zero or more times after
   /// streamingSendHeaders() and before streamingFinish().
   proxy_wasm::WasmResult streamingWriteChunk(std::string_view data) {
-    if (!conn_) {
-      LOG_ERROR("[Streaming] no ConnectionIO — cannot write chunk");
+    if (!sink_) {
+      LOG_ERROR("[Streaming] no ResponseSink — cannot write chunk");
       return proxy_wasm::WasmResult::InternalFailure;
     }
     if (streaming_state_ != StreamingResponseState::HeadersSent) {
@@ -539,27 +501,18 @@ public:
       return proxy_wasm::WasmResult::BadArgument;
     }
     if (!data.empty()) {
-      // Wrap data in HTTP/1.1 chunked transfer encoding:
-      //   <hex-size>\r\n<data>\r\n
-      // The data is copied because writeData() blocks until the epoll loop
-      // drains the buffer, and the WASM linear memory backing this
-      // string_view may not remain valid across that wait.
-      char size_buf[24];
-      int n = std::snprintf(size_buf, sizeof(size_buf), "%zx\r\n", data.size());
-      std::string chunk;
-      chunk.reserve(static_cast<size_t>(n) + data.size() + 2);
-      chunk.append(size_buf, static_cast<size_t>(n));
-      chunk.append(data.data(), data.size());
-      chunk.append("\r\n");
-      conn_->writeData(std::move(chunk));
+      if (!sink_->writeBody(data)) {
+        LOG_ERROR("[Streaming] writeBody failed");
+        return proxy_wasm::WasmResult::InternalFailure;
+      }
     }
     return proxy_wasm::WasmResult::Ok;
   }
 
   /// Signal that the response is complete.  No more chunks may be written.
   proxy_wasm::WasmResult streamingFinish() {
-    if (!conn_) {
-      LOG_ERROR("[Streaming] no ConnectionIO — cannot finish");
+    if (!sink_) {
+      LOG_ERROR("[Streaming] no ResponseSink — cannot finish");
       return proxy_wasm::WasmResult::InternalFailure;
     }
     if (streaming_state_ != StreamingResponseState::HeadersSent) {
@@ -567,19 +520,18 @@ public:
                 << static_cast<int>(streaming_state_) << ")");
       return proxy_wasm::WasmResult::BadArgument;
     }
-    // Send the chunked transfer encoding terminator: zero-length chunk.
-    conn_->writeData(std::string("0\r\n\r\n"));
+    if (!sink_->finishBody()) {
+      LOG_ERROR("[Streaming] finishBody failed");
+      return proxy_wasm::WasmResult::InternalFailure;
+    }
     streaming_state_ = StreamingResponseState::Finished;
-    // Do NOT call conn_->finish() here — the host's handle_request()
-    // owns the lifecycle and will call finish() after the filter chain
-    // returns.
     LOG_INFO("[Streaming] response finished");
     return proxy_wasm::WasmResult::Ok;
   }
 
   /// Reset streaming state between requests (if context is reused).
   void resetStreamingState() {
-    conn_ = nullptr;
+    sink_ = nullptr;
     streaming_state_ = StreamingResponseState::Idle;
   }
 
@@ -607,7 +559,7 @@ private:
   proxy_wasm::BufferBase buffer_;
 
   // ---- Streaming response state ----
-  ConnectionIO *conn_ = nullptr;
+  ResponseSink *sink_ = nullptr;
   StreamingResponseState streaming_state_ = StreamingResponseState::Idle;
 };
 

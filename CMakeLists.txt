@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(lswasm VERSION 1.0.0 LANGUAGES CXX)
+project(lswasm VERSION 1.0.0 LANGUAGES CXX C)
 
 # V8 ≥ 12.x requires C++20 (uses `requires` clauses in internal headers).
 # Other runtimes work fine with C++17.
@@ -448,6 +448,7 @@ add_executable(lswasm
   src/main.cpp
   src/wasm_module_manager.cc
   src/hash_shim.cc
+  src/lsapilib.c
 )
 
 target_include_directories(lswasm PRIVATE 

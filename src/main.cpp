@@ -45,9 +45,15 @@
 
 #include "connection_io.h"
 #include "http_filter.h"
+#include "http_response_sink.h"
 #include "thread_pool.h"
 #include "wasm_module_manager.h"
 #include "proxy-wasm/exports.h"   // RegisterForeignFunction, current_context_
+
+// LSAPI support (C library)
+extern "C" {
+#include "lsapilib.h"
+}
 
 // Version (injected by CMake via -DLSWASM_VERSION="x.y.z")
 #ifndef LSWASM_VERSION
@@ -722,10 +728,13 @@ private:
             return;
         }
 
+        // Create a response sink for HTTP transport.
+        HttpResponseSink sink(conn.get());
+
         // Create a filter context for this request.
         uint32_t ctx_id = g_next_context_id.fetch_add(1);
         HttpFilterContext filter_ctx(ctx_id, &http_data);
-        filter_ctx.setConnectionIO(conn.get());
+        filter_ctx.setResponseSink(&sink);
         filter_ctx.onCreate();
 
         // Execute request header phase via filter chain.
@@ -1011,6 +1020,287 @@ void signal_handler(int sig) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  LSAPI transport mode
+//
+//  When --lsapi is specified on the command line, lswasm operates as an
+//  LSAPI application process.  LiteSpeed web server connects to lswasm
+//  via the LSAPI protocol instead of HTTP.
+//
+//  The LSAPI accept loop is synchronous (no epoll/thread-pool).  Each
+//  accepted request is processed inline via the same WASM filter chain
+//  used by the HTTP path, but I/O goes through LsapiResponseSink.
+// ═══════════════════════════════════════════════════════════════════════
+
+#include "lsapi_response_sink.h"
+
+namespace {
+
+// LSAPI_ForeachHeader_r callback: accumulate headers into HeaderPairs.
+int lsapi_header_cb(const char *key, int keyLen,
+                    const char *value, int valLen, void *arg) {
+    LOG_INFO("lsapi_header: " << std::string(key, static_cast<size_t>(keyLen)) << " = "
+             << std::string(value, static_cast<size_t>(valLen)));
+    auto *hdrs = static_cast<HeaderPairs *>(arg);
+    // LSAPI delivers CGI-style header names (HTTP_ACCEPT, HTTP_HOST, …).
+    // Convert them to standard HTTP header names:
+    //   - strip the "HTTP_" prefix
+    //   - replace underscores with hyphens
+    //   - title-case each word
+    std::string name(key, static_cast<size_t>(keyLen));
+    if (name.size() > 5 && name.substr(0, 5) == "HTTP_") {
+        name = name.substr(5);
+    }
+    for (size_t i = 0; i < name.size(); ++i) {
+        if (name[i] == '_') name[i] = '-';
+    }
+    // Title-case: first char and chars after '-' are upper, rest lower.
+    bool next_upper = true;
+    for (char &c : name) {
+        if (c == '-') {
+            next_upper = true;
+        } else if (next_upper) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            next_upper = false;
+        } else {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    }
+    hdrs->emplace_back(std::move(name), std::string(value, static_cast<size_t>(valLen)));
+    return 1;  // continue iteration
+}
+
+/// Process a single LSAPI request through the WASM filter chain.
+/// This is the LSAPI analogue of HttpServer::handle_request().
+void lsapi_handle_request(LSAPI_Request *req) {
+    LOG_INFO("Processing LSAPI request.");
+    HttpData http_data;
+
+    // ── Populate request method, path, version ──
+    char *method = LSAPI_GetRequestMethod_r(req);
+    http_data.method = method ? method : "GET";
+
+    // Build the request path from SCRIPT_NAME + QUERY_STRING.
+    char *script = LSAPI_GetScriptName_r(req);
+    char *query  = LSAPI_GetQueryString_r(req);
+    if (script) {
+        http_data.path = script;
+    } else {
+        // Fall back to REQUEST_URI if available.
+        char *uri = LSAPI_GetEnv_r(req, "REQUEST_URI");
+        http_data.path = uri ? uri : "/";
+    }
+    if (query && query[0] != '\0') {
+        http_data.path += '?';
+        http_data.path += query;
+    }
+
+    // LSAPI does not expose HTTP version directly; assume HTTP/1.1.
+    http_data.version = "HTTP/1.1";
+
+    // ── Populate request headers ──
+    LSAPI_ForeachHeader_r(req, lsapi_header_cb, &http_data.request_headers);
+
+    // If Content-Type is present from the CGI env vars but missing from
+    // the header list, add it.  Same for Content-Length.
+    auto has_hdr = [&](const char *name) {
+        for (const auto &p : http_data.request_headers) {
+            if (header_name_eq(p.first, name)) return true;
+        }
+        return false;
+    };
+    if (!has_hdr("Content-Type")) {
+        char *ct = LSAPI_GetHeader_r(req, H_CONTENT_TYPE);
+        if (ct && ct[0] != '\0') {
+            http_data.request_headers.emplace_back("Content-Type", ct);
+        }
+    }
+    if (!has_hdr("Content-Length")) {
+        char *cl = LSAPI_GetHeader_r(req, H_CONTENT_LENGTH);
+        if (cl && cl[0] != '\0') {
+            http_data.request_headers.emplace_back("Content-Length", cl);
+        }
+    }
+
+    // ── Create ResponseSink and filter context ──
+    LsapiResponseSink sink(req);
+    uint32_t ctx_id = g_next_context_id.fetch_add(1);
+    HttpFilterContext filter_ctx(ctx_id, &http_data);
+    filter_ctx.setResponseSink(&sink);
+    filter_ctx.onCreate();
+
+    // ── Request headers phase ──
+    off_t body_len = LSAPI_GetReqBodyLen_r(req);
+    bool has_body = (body_len > 0);
+    LOG_INFO("\n[LSAPI] Processing request in filter chain...");
+    filter_ctx.onRequestHeaders(/*end_of_stream=*/!has_body);
+
+    if (http_data.has_local_response) {
+        LOG_INFO("[LSAPI] WASM filter sent local response.");
+        sink.sendHeaders(http_data.local_response_code,
+                         http_data.local_response_additional_headers,
+                         /*streaming=*/false);
+        sink.writeBody(http_data.local_response_body);
+        sink.finishBody();
+        return;
+    }
+
+    // ── Stream request body ──
+    if (has_body) {
+        char body_buf[BODY_CHUNK_SIZE];
+        off_t body_consumed = 0;
+        while (body_consumed < body_len && !http_data.has_local_response) {
+            size_t want = std::min(static_cast<size_t>(body_len - body_consumed),
+                                   BODY_CHUNK_SIZE);
+            ssize_t n = LSAPI_ReadReqBody_r(req, body_buf, want);
+            if (n <= 0) {
+                LOG_ERROR("[LSAPI] Request body read error after "
+                          << body_consumed << " / " << body_len << " bytes");
+                return;
+            }
+            body_consumed += n;
+            http_data.request_body.assign(body_buf, static_cast<size_t>(n));
+            filter_ctx.onRequestBody(body_consumed >= body_len);
+        }
+    }
+
+    if (!http_data.has_local_response) {
+        filter_ctx.onRequestTrailers();
+    }
+
+    if (http_data.has_local_response) {
+        sink.sendHeaders(http_data.local_response_code,
+                         http_data.local_response_additional_headers,
+                         /*streaming=*/false);
+        sink.writeBody(http_data.local_response_body);
+        sink.finishBody();
+        return;
+    }
+
+    // Request-phase streaming responses.
+    if (filter_ctx.hasStreamingResponse()) {
+        if (!filter_ctx.isStreamingFinished()) {
+            LOG_ERROR("[LSAPI] Streaming response started but was not finished");
+            return;
+        }
+        LOG_INFO("[LSAPI] Streaming response handled by WASM filter.");
+        filter_ctx.onDone();
+        return;
+    }
+
+    // ── Generate default response ──
+    http_data.response_body.clear();
+    if (g_body_pacifier) {
+        // Re-use the diagnostic body builder from HttpServer (static-like).
+        http_data.response_body = "=== WASM LSAPI Proxy ===\n";
+        http_data.response_body += "Method: " + http_data.method + "\n";
+        http_data.response_body += "Path: " + http_data.path + "\n";
+    }
+
+    http_data.response_headers.clear();
+    http_data.response_headers.emplace_back("Content-Type", "text/plain");
+
+    // ── Response phases ──
+    LOG_INFO("[LSAPI] Processing response in filter chain...");
+    filter_ctx.onResponseHeaders();
+    filter_ctx.onResponseBody();
+    filter_ctx.onResponseTrailers();
+
+    if (http_data.has_local_response) {
+        if (filter_ctx.hasStreamingResponse()) {
+            LOG_ERROR("[LSAPI] Local response after streaming started");
+            return;
+        }
+        filter_ctx.onDone();
+        sink.sendHeaders(http_data.local_response_code,
+                         http_data.local_response_additional_headers,
+                         /*streaming=*/false);
+        sink.writeBody(http_data.local_response_body);
+        sink.finishBody();
+        return;
+    }
+
+    if (filter_ctx.hasStreamingResponse()) {
+        if (!filter_ctx.isStreamingFinished()) {
+            LOG_ERROR("[LSAPI] Streaming response started but was not finished");
+            return;
+        }
+        LOG_INFO("[LSAPI] Streaming response handled by WASM filter.");
+        filter_ctx.onDone();
+        return;
+    }
+
+    filter_ctx.onDone();
+
+    // Add Content-Length.
+    HeaderPairs &hdrs = http_data.response_headers;
+    hdrs.erase(std::remove_if(hdrs.begin(), hdrs.end(),
+        [](const std::pair<std::string, std::string> &p) {
+            return header_name_eq(p.first, "Content-Length");
+        }), hdrs.end());
+    hdrs.emplace_back("Content-Length",
+                       std::to_string(http_data.response_body.length()));
+
+    sink.sendHeaders(200, hdrs, /*streaming=*/false);
+    sink.writeBody(http_data.response_body);
+    sink.finishBody();
+}
+
+/// Run the LSAPI accept loop.  Blocks until the web server closes the
+/// connection or the process is terminated.
+///
+/// Module loading is deferred to after LSAPI_Prefork_Accept_r() returns
+/// in the child process.  This ensures the WASM runtime (V8, Wasmtime,
+/// WasmEdge, etc.) is initialised entirely within the child, avoiding
+/// fork-safety issues with JIT compiler threads that do not survive fork.
+int run_lsapi_loop(const std::string &wasm_module_path,
+                   const std::unordered_map<std::string, std::string> &wasm_envs) {
+    LOG_INFO("[LSAPI] Initializing LSAPI...");
+    if (LSAPI_Init() < 0) {
+        LOG_ERROR("[LSAPI] LSAPI_Init() failed");
+        return 1;
+    }
+    LSAPI_Init_Env_Parameters(nullptr);
+
+    bool module_loaded = false;
+
+    LOG_INFO("[LSAPI] Entering accept loop...");
+    while (LSAPI_Prefork_Accept_r(&g_req) >= 0) {
+        if (g_shutdown.load(std::memory_order_relaxed)) break;
+
+        // Deferred module loading: on the first request in this child
+        // process, create the WasmModuleManager and load the module.
+        if (!module_loaded) {
+            g_module_manager = std::make_unique<WasmModuleManager>();
+            if (!wasm_envs.empty()) {
+                g_module_manager->setEnvironmentVariables(wasm_envs);
+            }
+            std::string module_name = "custom_filter";
+            LOG_INFO("[LSAPI] Loading WASM module (post-fork): " << wasm_module_path);
+            if (!g_module_manager->loadModule(wasm_module_path, module_name)) {
+                LOG_ERROR("[LSAPI] Failed to load WASM module — returning 500 for this and all subsequent requests");
+                LSAPI_Finish_r(&g_req);
+                break;
+            }
+            LOG_INFO("[LSAPI] ✓ WASM module loaded successfully in child process");
+            module_loaded = true;
+        }
+
+        lsapi_handle_request(&g_req);
+        LSAPI_Finish_r(&g_req);
+    }
+
+    LOG_INFO("[LSAPI] Accept loop exited.");
+    g_module_manager.reset();
+    return 0;
+}
+
+} // anonymous namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+//  main()
+// ═══════════════════════════════════════════════════════════════════════
+
 int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
     std::string wasm_module_path;
@@ -1019,6 +1309,7 @@ int main(int argc, char *argv[]) {
     std::unordered_map<std::string, std::string> wasm_envs;
     bool debug = false;
     bool port_specified = false;
+    bool lsapi_mode = false;
     size_t num_workers = 0;  // 0 = auto (hardware_concurrency)
 
     // Parse command line arguments
@@ -1053,6 +1344,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (arg == "--workers" && i + 1 < argc) {
             num_workers = static_cast<size_t>(std::stoi(argv[++i]));
+        } else if (arg == "--lsapi") {
+            lsapi_mode = true;
         } else if (arg == "--body-pacifier") {
             g_body_pacifier = true;
         } else if (arg == "--debug") {
@@ -1072,6 +1365,7 @@ int main(int argc, char *argv[]) {
             std::cout << "  --module PATH    : Load WASM filter module (required)\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
             std::cout << "  --workers N      : Number of worker threads (default: hardware_concurrency)\n";
+            std::cout << "  --lsapi          : Use LSAPI transport (instead of HTTP)\n";
             std::cout << "  --body-pacifier  : Include diagnostic body in HTTP responses\n";
             std::cout << "  --debug          : Enable debug logging to "
                       << lswasm_log::LOG_PATH << "\n";
@@ -1080,18 +1374,30 @@ int main(int argc, char *argv[]) {
             std::cout << "\nBy default, listens on UDS at " << DEFAULT_UDS_PATH << ".\n";
             std::cout << "Use --port to listen on TCP instead. "
                       << "When both --port and --uds are given, only --uds is used.\n";
+            std::cout << "Use --lsapi for LSAPI transport mode (used by LiteSpeed web server).\n";
             return 0;
         }
+    }
+
+    // Validate --lsapi mutual exclusion with HTTP-only options.
+    if (lsapi_mode && port_specified) {
+        std::cerr << "Error: --lsapi and --port are mutually exclusive.\n";
+        return 1;
     }
 
     // Initialize logging: active if /tmp/lswasm.dolog exists or --debug is given.
     lswasm_log::log_init(debug);
 
-    // Initialize WASM module manager.
-    g_module_manager = std::make_unique<WasmModuleManager>();
+    // Validate --module (required for all modes).
+    if (wasm_module_path.empty()) {
+        LOG_ERROR("No WASM module specified. Use --module <path> to load a filter.");
+        std::cerr << "Error: --module is required. Run with --help for usage.\n";
+        return 1;
+    }
 
     // Print runtime information
     LOG_INFO("\n=== lswasm " << LSWASM_VERSION << " ===");
+    LOG_INFO("Transport: " << (lsapi_mode ? "LSAPI" : "HTTP"));
 #if defined(WASM_RUNTIME_WASMTIME)
     LOG_INFO("✓ Wasmtime runtime enabled");
 #elif defined(WASM_RUNTIME_V8)
@@ -1109,7 +1415,30 @@ int main(int argc, char *argv[]) {
     LOG_INFO("  • proxy-wasm-spec");
     LOG_INFO("==============================\n");
 
-    // Set environment variables for WASM modules
+    // Register signal handlers.
+    {
+        struct sigaction sa{};
+        sa.sa_handler = signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;  // No SA_RESTART – we want epoll_wait/accept to return EINTR.
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+    }
+
+    // ── Branch on transport mode ──────────────────────────────────────────
+    if (lsapi_mode) {
+        // LSAPI transport — synchronous accept loop, no thread pool.
+        // Module loading is deferred to after LSAPI_Prefork_Accept_r() forks
+        // so each child process creates a fresh WASM runtime, avoiding
+        // fork-safety issues with JIT threads (V8, Wasmtime, WasmEdge).
+        LOG_INFO("Starting LSAPI transport mode (deferred module loading)...");
+        return run_lsapi_loop(wasm_module_path, wasm_envs);
+    }
+
+    // ── HTTP transport mode (default) ─────────────────────────────────────
+    // Initialize WASM module manager and load the module eagerly (no fork).
+    g_module_manager = std::make_unique<WasmModuleManager>();
+
     if (!wasm_envs.empty()) {
         LOG_INFO("WASM environment variables:");
         for (const auto &[key, value] : wasm_envs) {
@@ -1118,12 +1447,6 @@ int main(int argc, char *argv[]) {
         g_module_manager->setEnvironmentVariables(wasm_envs);
     }
 
-    // Load WASM module (required).
-    if (wasm_module_path.empty()) {
-        LOG_ERROR("No WASM module specified. Use --module <path> to load a filter.");
-        std::cerr << "Error: --module is required. Run with --help for usage.\n";
-        return 1;
-    }
     {
         std::string module_name = "custom_filter";
         LOG_INFO("Loading WASM filter module: " << wasm_module_path);
@@ -1135,16 +1458,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Register signal handlers AFTER V8/runtime initialisation.
-    {
-        struct sigaction sa{};
-        sa.sa_handler = signal_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;  // No SA_RESTART – we want epoll_wait/accept to return EINTR.
-        sigaction(SIGINT, &sa, nullptr);
-        sigaction(SIGTERM, &sa, nullptr);
-    }
-
+    // ── HTTP transport mode (default) ────────────────────────────────────
     // Create thread pool for worker threads.
     ThreadPool pool(num_workers);
     LOG_INFO("Thread pool started with " << pool.size() << " workers");

@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <sstream>
@@ -28,6 +30,17 @@
 
 // Owned header pairs type (std::string, not string_view).
 using HeaderPairs = std::vector<std::pair<std::string, std::string>>;
+
+// Case-insensitive comparison for HTTP header field names (RFC 7230 §3.2).
+inline bool header_name_eq(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i])))
+      return false;
+  }
+  return true;
+}
 
 namespace http_utils {
 

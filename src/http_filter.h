@@ -68,9 +68,9 @@ public:
   HttpFilterContext(uint32_t context_id, HttpData *http_data)
       : context_id_(context_id), http_data_(http_data) {}
 
-  /// Inject the ConnectionIO for this request so that streaming response
-  /// foreign-function handlers can write directly to the client socket.
-  void setConnectionIO(ConnectionIO *conn) { conn_ = conn; }
+  /// Inject the ResponseSink for this request so that streaming response
+  /// foreign-function handlers can write through the transport-abstract sink.
+  void setResponseSink(ResponseSink *sink) { sink_ = sink; }
 
   /// True if any WASM context in the filter chain started a streaming
   /// response (i.e. called lswasm_send_response_headers).
@@ -135,12 +135,10 @@ public:
           LOG_ERROR("[Filter] Failed to create RequestScope for module '" << m << "'");
           continue;
         }
-        // Inject ConnectionIO for streaming response support.
-        // Thread safety: conn_ is set once here on the worker thread and
+        // Inject ResponseSink for streaming response support.
+        // Thread safety: sink_ is set once here on the worker thread and
         // only used by this same worker thread during WASM callbacks.
-        // ConnectionIO::writeData() has its own internal mutex protection
-        // for the worker↔epoll boundary.
-        scope.context()->setConnectionIO(conn_);
+        scope.context()->setResponseSink(sink_);
         // Push request headers into the WASM context before execution.
         scope.context()->setHeaderMap(
             proxy_wasm::WasmHeaderMapType::RequestHeaders, http_data_->request_headers);
@@ -351,7 +349,7 @@ private:
 
   uint32_t context_id_;
   HttpData *http_data_;
-  ConnectionIO *conn_ = nullptr;  // Injected for streaming response support.
+  ResponseSink *sink_ = nullptr;  // Injected for streaming response support.
 
   // Persistent WASM contexts — created once in onRequestHeaders(), reused
   // across all subsequent phases, destroyed in ~HttpFilterContext().
