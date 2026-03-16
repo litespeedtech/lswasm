@@ -862,12 +862,14 @@ public:
   /**
    * RequestScope - Owns a stream context for one request's lifetime.
    *
-   * Calls getOrCreateThreadLocalPlugin() to obtain a per-thread VM clone,
-   * then creates a stream context on that clone.  Each worker thread gets
-   * its own VM instance — no locking needed on VM state.
+   * Uses a strong thread-local cache of plugin handles so that a worker thread
+   * can keep reusing the same VM/plugin instance across requests. Without this,
+   * the upstream proxy-wasm thread-local caches only hold weak references, which
+   * allows the last request-scoped reference to tear down the thread-local VM at
+   * the end of every request.
    *
-   * RAII: the destructor calls onDone() and onDelete() to properly tear
-   * down the WASM stream context.
+   * RAII: the destructor calls onDone() and onDelete() to properly tear down
+   * the WASM stream context for the current request.
    */
   class RequestScope {
   public:
@@ -878,10 +880,8 @@ public:
      * @return true if the scope was successfully created, false on failure.
      */
     bool init(const ModuleState &state, uint32_t context_id) {
-      // Obtain (or create) a thread-local VM clone + plugin context.
-      plugin_handle_ = proxy_wasm::getOrCreateThreadLocalPlugin(
-          state.base_handle, state.plugin,
-          state.clone_factory, state.plugin_factory);
+      // Obtain (or create) a persistent thread-local VM clone + plugin context.
+      plugin_handle_ = getPersistentThreadLocalPlugin(state);
       if (!plugin_handle_) {
         LOG_ERROR("[RequestScope] Failed to get thread-local plugin for context "
                   << context_id);
@@ -966,6 +966,50 @@ public:
     bool valid() const { return ctx_ != nullptr; }
 
   private:
+    static std::shared_ptr<proxy_wasm::PluginHandleBase>
+    getPersistentThreadLocalPlugin(const ModuleState &state) {
+      using PluginHandlePtr = std::shared_ptr<proxy_wasm::PluginHandleBase>;
+
+      struct CacheKey {
+        const void *base_handle = nullptr;
+        std::string plugin_key;
+
+        bool operator==(const CacheKey &other) const {
+          return base_handle == other.base_handle && plugin_key == other.plugin_key;
+        }
+      };
+
+      struct CacheKeyHash {
+        size_t operator()(const CacheKey &key) const {
+          size_t h1 = std::hash<const void *>{}(key.base_handle);
+          size_t h2 = std::hash<std::string>{}(key.plugin_key);
+          return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6) + (h1 >> 2));
+        }
+      };
+
+      static thread_local std::unordered_map<CacheKey, PluginHandlePtr, CacheKeyHash>
+          persistent_plugin_cache;
+
+      CacheKey key{state.base_handle.get(), state.plugin->key()};
+      auto it = persistent_plugin_cache.find(key);
+      if (it != persistent_plugin_cache.end()) {
+        const PluginHandlePtr &cached = it->second;
+        if (cached && cached->wasm() && !cached->wasm()->isFailed()) {
+          return cached;
+        }
+        persistent_plugin_cache.erase(it);
+      }
+
+      PluginHandlePtr plugin_handle = proxy_wasm::getOrCreateThreadLocalPlugin(
+          state.base_handle, state.plugin, state.clone_factory, state.plugin_factory);
+      if (!plugin_handle || !plugin_handle->wasm() || plugin_handle->wasm()->isFailed()) {
+        return nullptr;
+      }
+
+      persistent_plugin_cache.emplace(key, plugin_handle);
+      return plugin_handle;
+    }
+
     lswasm::LsWasmContext *ctx_ = nullptr;
     std::shared_ptr<proxy_wasm::PluginHandleBase> plugin_handle_;
     uint32_t context_id_ = 0;

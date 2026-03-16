@@ -7,12 +7,13 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 ## Features
 
 - **Multi-threaded** `epoll`-based HTTP server (Linux) with configurable worker thread pool (`--workers N`)
+- **LSAPI transport mode** for running behind LiteSpeed/OpenLiteSpeed with `--lsapi`
 - Thread-local WASM VM cloning via proxy-wasm-cpp-host's `getOrCreateThreadLocalPlugin()` — each worker thread gets its own VM instance
-- TCP and **Unix domain socket** listeners
+- TCP and **Unix domain socket** listeners for standalone HTTP mode
 - WASM filter module loading and execution via proxy-wasm-cpp-host
 - HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
 - **Response header manipulation** from WASM modules via proxy-wasm ABI
-- **Streaming response API** — WASM modules can send chunked/streaming HTTP responses via foreign functions (`lswasm_send_response_headers`, `lswasm_write_response_chunk`, `lswasm_finish_response`)
+- **Streaming response API** — WASM modules can send streaming HTTP responses over both standalone HTTP and LSAPI transports via foreign functions (`lswasm_send_response_headers`, `lswasm_write_response_chunk`, `lswasm_finish_response`)
 - Support for Wasmtime, V8, WasmEdge, and WAMR runtimes (selectable via `-DWASM_RUNTIME=`)
 - Per-module environment variables (`--env KEY=VALUE`)
 - Reader-writer locked metrics (atomic counters/gauges) and reader-writer locked module registry
@@ -408,9 +409,9 @@ cmake --build . -j$(nproc)
 The `--module` flag is **required** — lswasm will exit with an error if no
 WASM filter module is specified.
 
-By default, lswasm listens on a Unix domain socket at `/tmp/lswasm.sock`
-using `std::thread::hardware_concurrency()` worker threads (or 4 if
-detection fails).
+By default, lswasm runs in standalone HTTP mode and listens on a Unix domain
+socket at `/tmp/lswasm.sock` using `std::thread::hardware_concurrency()`
+worker threads (or 4 if detection fails).
 
 ### Custom Worker Count
 
@@ -433,6 +434,26 @@ detection fails).
 
 When both `--port` and `--uds` are given, only `--uds` is used.
 
+### LSAPI Transport Mode
+
+```bash
+./lswasm --module filter.wasm --lsapi
+```
+
+Use `--lsapi` to run lswasm as an LSAPI application process for
+LiteSpeed/OpenLiteSpeed instead of exposing the standalone HTTP listener.
+In this mode, LiteSpeed communicates with lswasm over the LSAPI protocol,
+and lswasm uses [`LsapiResponseSink`](src/lsapi_response_sink.h:29) rather than
+HTTP chunked transfer framing.
+
+Notes for `--lsapi` mode:
+
+- It is intended for LiteSpeed/OpenLiteSpeed integration.
+- `--lsapi` and `--port` are mutually exclusive.
+- The standalone HTTP listener settings (`--port`, `--uds`, `--sock-perm`,
+  `--workers`) do not apply to LSAPI transport.
+- The same WASM filter chain and streaming response API remain available.
+
 ### Passing Environment Variables to WASM Modules
 
 ```bash
@@ -449,19 +470,21 @@ When both `--port` and `--uds` are given, only `--uds` is used.
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `--port` | `PORT` | Listen on a TCP port instead of a Unix domain socket |
-| `--uds` | `PATH` | Listen on a Unix domain socket (default: `/tmp/lswasm.sock`) |
-| `--sock-perm` | `MODE` | Set UDS file permissions in octal (default: `0666`) |
+| `--port` | `PORT` | Listen on a TCP port instead of a Unix domain socket (standalone HTTP mode only) |
+| `--uds` | `PATH` | Listen on a Unix domain socket (default: `/tmp/lswasm.sock`) in standalone HTTP mode |
+| `--sock-perm` | `MODE` | Set UDS file permissions in octal (default: `0666`) for standalone HTTP mode |
 | `--module` | `PATH` | **(required)** Load a WASM filter module |
 | `--env` | `KEY=VALUE` | Set an environment variable for WASM modules (repeatable) |
-| `--workers` | `N` | Number of worker threads (default: `hardware_concurrency()` or 4) |
+| `--workers` | `N` | Number of worker threads (default: `hardware_concurrency()` or 4) in standalone HTTP mode |
+| `--lsapi` | — | Use LSAPI transport instead of the standalone HTTP listener |
 | `--body-pacifier` | — | Include a diagnostic body in HTTP responses (request info, runtime, filters) |
 | `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
 | `--version` | — | Print version number and exit |
 | `--help` | — | Show usage information and exit |
 
 When both `--port` and `--uds` are given, only `--uds` is used.
-By default (no `--port`), lswasm listens on the UDS path.
+By default (without `--lsapi`), lswasm listens on the UDS path.
+`--lsapi` and `--port` are mutually exclusive.
 
 ## Installing as a Service
 
@@ -640,7 +663,14 @@ Runtime found: TRUE
 
 ## Configuring LiteSpeed
 
-To configure LiteSpeed (Enterprise or OpenLiteSpeed) there are many ways to do it.  Note that lswasm runs as a separate HTTP server and LiteSpeed will operate as a proxy to it.  The instructions below assume:
+To configure LiteSpeed (Enterprise or OpenLiteSpeed) there are many ways to do it.  lswasm supports two integration models:
+
+- **Standalone HTTP mode** (default): lswasm runs as a separate HTTP server over UDS/TCP and LiteSpeed proxies requests to it.
+- **LSAPI mode** (`--lsapi`): lswasm runs as an LSAPI application process and speaks the LSAPI protocol directly.
+
+The instructions below describe the standalone HTTP proxy setup. If you want LiteSpeed to launch lswasm directly as an LSAPI app, run lswasm with `--lsapi` and configure it as an LSAPI external application instead of a web-server proxy target.
+
+These standalone HTTP instructions assume:
 
 - An overall configuration.  This will work with OpenLiteSpeed and in LiteSpeed Enterprise in non-Apache mode.  In Apache mode, you will want to setup rewrite files to it.
 - You are just testing it out and thus will use the sample application (from above).
@@ -696,12 +726,20 @@ important.
 
 | Function | Argument | Description |
 |----------|----------|-------------|
-| `lswasm_send_response_headers` | 4-byte status code + marshalled header pairs | Begin a streaming response with the given HTTP status and headers |
+| `lswasm_send_response_headers` | 4-byte `uint32_t` status code + marshalled header pairs | Begin a streaming response with the given HTTP status and headers |
 | `lswasm_write_response_chunk` | Raw body bytes | Write a chunk of response body data to the client |
 | `lswasm_finish_response` | *(none)* | Signal end-of-response — no more chunks may be written |
 
 These are invoked via `proxy_call_foreign_function()` from the proxy-wasm
 SDK.
+
+On the HTTP transport, the host writes streaming responses using HTTP/1.1
+chunked transfer encoding. Header handling is normalized by the server:
+
+- `Content-Length` is removed for streaming responses.
+- `Transfer-Encoding: chunked` is added automatically if it is not already
+  present.
+- Conflicting `Transfer-Encoding` values are rejected.
 
 ### C++ Convenience Header
 
@@ -716,8 +754,8 @@ directly:
 
 // 1. Send response headers (starts the streaming response).
 lswasm::streaming::sendResponseHeaders(200, {
-    {"content-type", "text/plain"},
-    {"x-custom",     "value"},
+    {"Content-Type",  "text/plain"},
+    {"X-Wasm-Filter", "example/active"},
 });
 
 // 2. Write body chunks as they become available.
@@ -730,16 +768,25 @@ lswasm::streaming::finishResponse();
 ### Lifecycle Rules
 
 1. **`sendResponseHeaders`** must be called exactly once, before any chunks.
-2. **`writeResponseChunk`** may be called zero or more times.
-3. **`finishResponse`** must be called exactly once to close the response.
-4. Calling these out of order returns `WasmResult::BadArgument`.
+2. **`writeResponseChunk`** may be called zero or more times after
+   **`sendResponseHeaders`**.
+3. **`finishResponse`** must be called exactly once after
+   **`sendResponseHeaders`** and before the request completes.
+4. Calling **`writeResponseChunk`** or **`finishResponse`** before headers are
+   sent, or calling any streaming function after the response is finished,
+   returns `WasmResult::BadArgument`.
+5. Once a streaming response starts, it becomes the terminal response path for
+   that request; the filter must finish it instead of later switching to
+   `sendLocalResponse()`.
 
 ### Detecting Host Support
 
 If your filter must run on hosts that may not support the streaming API, call
-`lswasm::streaming::isSupported()` *before* `sendResponseHeaders()`.  It
-returns `false` on hosts that don't register the foreign functions (the call
-returns `WasmResult::NotFound`), letting you fall back to
+`lswasm::streaming::isSupported()` *before* `sendResponseHeaders()`. The host
+implements this probe by recognizing a zero-argument
+`lswasm_send_response_headers` call and returning `WasmResult::BadArgument`.
+Hosts that do not register the foreign function return `WasmResult::NotFound`,
+allowing the wrapper to return `false` so you can fall back to
 `sendLocalResponse()`.
 
 ### Samples

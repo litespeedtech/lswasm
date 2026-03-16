@@ -88,9 +88,16 @@ private:
   // (caller should fall back to sendLocalResponse).
   bool streamPreamble();
 
+  // Record a terminal streaming failure after headers were committed.
+  void markStreamingFailed(const std::string &operation, WasmResult rc);
+
+  // Finish the streaming response, recording any terminal failure.
+  bool finishStreamingResponse();
+
   std::string preamble_;             // diagnostic text (env + headers)
   bool streaming_supported_ = false; // host has the streaming API?
   bool headers_sent_ = false;        // streaming headers already sent?
+  bool stream_failed_ = false;       // streamed write failed after start?
   size_t total_body_echoed_ = 0;     // bytes of request body echoed
 };
 
@@ -160,15 +167,38 @@ void SendRecvStreamContext::buildPreamble() {
 }
 
 // ---------------------------------------------------------------------------
+// Stream helpers.
+// ---------------------------------------------------------------------------
+void SendRecvStreamContext::markStreamingFailed(const std::string &operation,
+                                                WasmResult rc) {
+  LOG_ERROR("send_recv_stream: " + operation + " failed (rc=" +
+            std::to_string(static_cast<int>(rc)) + ")");
+  stream_failed_ = true;
+}
+
+bool SendRecvStreamContext::finishStreamingResponse() {
+  if (stream_failed_) {
+    return false;
+  }
+
+  WasmResult rc = lswasm::streaming::finishResponse();
+  if (rc != WasmResult::Ok) {
+    markStreamingFailed("finishResponse", rc);
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Stream the preamble.
 // ---------------------------------------------------------------------------
 bool SendRecvStreamContext::streamPreamble() {
+  if (stream_failed_) return false;
   if (headers_sent_) return true;
 
   // Send HTTP response headers.
   lswasm::streaming::HeaderList response_headers;
   response_headers.emplace_back("Content-Type", "text/plain");
-  response_headers.emplace_back("Connection", "close");
   response_headers.emplace_back("X-Wasm-Filter", "send_recv_stream/active");
   response_headers.emplace_back("X-Powered-By", "lswasm/proxy-wasm");
 
@@ -183,9 +213,10 @@ bool SendRecvStreamContext::streamPreamble() {
   // Write the preamble as the first body chunk.
   if (!preamble_.empty()) {
     rc = lswasm::streaming::writeResponseChunk(preamble_.data(),
-                                                preamble_.size());
+                                               preamble_.size());
     if (rc != WasmResult::Ok) {
-      LOG_ERROR("send_recv_stream: writeResponseChunk (preamble) failed");
+      markStreamingFailed("writeResponseChunk (preamble)", rc);
+      return false;
     }
     preamble_.clear();  // free memory
     preamble_.shrink_to_fit();
@@ -213,11 +244,18 @@ FilterHeadersStatus SendRecvStreamContext::onRequestHeaders(
     // No body expected — send the entire response now.
     if (streaming_supported_) {
       if (streamPreamble()) {
-        lswasm::streaming::writeResponseChunk("(no body)\n", 10);
-        lswasm::streaming::finishResponse();
+        WasmResult rc = lswasm::streaming::writeResponseChunk("(no body)\n", 10);
+        if (rc != WasmResult::Ok) {
+          markStreamingFailed("writeResponseChunk ((no body))", rc);
+          return FilterHeadersStatus::StopIteration;
+        }
+        finishStreamingResponse();
         return FilterHeadersStatus::StopIteration;
       }
-      // Fall through to sendLocalResponse on failure.
+      if (headers_sent_ || stream_failed_) {
+        return FilterHeadersStatus::StopIteration;
+      }
+      // Fall through to sendLocalResponse on failure before streaming started.
     }
     // Fallback: traditional single-shot response.
     std::string body = std::move(preamble_);
@@ -239,11 +277,14 @@ FilterDataStatus SendRecvStreamContext::onRequestBody(
            std::to_string(body_buffer_length) +
            ", eos=" + std::to_string(end_of_stream) + ")");
 
-  if (streaming_supported_) {
+  if (streaming_supported_ && !stream_failed_) {
     // Ensure headers + preamble have been sent.
     if (!streamPreamble()) {
-      // Streaming failed — fall back to single-shot.
-      // This is a rare edge case; log and continue.
+      if (headers_sent_ || stream_failed_) {
+        return end_of_stream ? FilterDataStatus::StopIterationNoBuffer
+                             : FilterDataStatus::StopIterationAndBuffer;
+      }
+      // Streaming could not be started — fall back to single-shot.
       LOG_ERROR("send_recv_stream: streaming fallback — "
                 "preamble send failed during body phase");
       streaming_supported_ = false;
@@ -256,16 +297,16 @@ FilterDataStatus SendRecvStreamContext::onRequestBody(
     WasmDataPtr chunk =
         getBufferBytes(WasmBufferType::HttpRequestBody, 0, body_buffer_length);
     if (chunk && chunk->size() > 0) {
-      if (streaming_supported_) {
+      if (streaming_supported_ && !stream_failed_) {
         // Stream the chunk directly to the client.
         WasmResult rc = lswasm::streaming::writeResponseChunk(
             chunk->data(), chunk->size());
         if (rc != WasmResult::Ok) {
-          LOG_ERROR("send_recv_stream: writeResponseChunk failed (rc=" +
-                    std::to_string(static_cast<int>(rc)) + ")");
+          markStreamingFailed("writeResponseChunk (body)", rc);
+        } else {
+          total_body_echoed_ += chunk->size();
         }
-        total_body_echoed_ += chunk->size();
-      } else {
+      } else if (!stream_failed_) {
         // Non-streaming fallback: accumulate.
         preamble_.append(chunk->data(), chunk->size());
       }
@@ -278,9 +319,11 @@ FilterDataStatus SendRecvStreamContext::onRequestBody(
 
   // End of stream — finish the response.
   if (streaming_supported_) {
-    LOG_INFO("send_recv_stream: finishing streaming response, "
-             "total_body_echoed=" + std::to_string(total_body_echoed_));
-    lswasm::streaming::finishResponse();
+    if (!stream_failed_) {
+      LOG_INFO("send_recv_stream: finishing streaming response, "
+               "total_body_echoed=" + std::to_string(total_body_echoed_));
+      finishStreamingResponse();
+    }
   } else {
     // Fallback: send everything via sendLocalResponse.
     if (preamble_.empty()) {

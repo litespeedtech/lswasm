@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -71,7 +72,9 @@ const size_t BODY_CHUNK_SIZE = 524288;  // 512 KB streaming chunk size
 
 // Global state
 static std::atomic<bool> g_shutdown{false};
-static int g_server_socket = -1;  // For signal handler to unblock accept()
+static int g_server_socket = -1;  // For shutdown coordination to unblock accept()/read().
+constexpr size_t MAX_TRACKED_LSAPI_FDS = 4096;
+static int g_tracked_lsapi_fds[MAX_TRACKED_LSAPI_FDS] = {};
 static std::string g_uds_path;    // For cleanup on shutdown
 static std::atomic<uint32_t> g_next_context_id{1};
 static bool g_body_pacifier = false;  // When true, include diagnostic body in responses.
@@ -93,6 +96,13 @@ lswasm::LsWasmContext *streaming_context() {
   return ctx;
 }
 
+} // anonymous namespace
+
+namespace {
+int reserve_tracked_lsapi_fd_slot();
+void publish_tracked_lsapi_fd(int slot, int fd);
+void clear_tracked_lsapi_fd(int slot);
+void shutdown_tracked_lsapi_fds();
 } // anonymous namespace
 
 // ── lswasm_send_response_headers ──
@@ -1009,13 +1019,18 @@ private:
     int server_socket_;
 };
 
-// Signal handler (only async-signal-safe operations)
+// Signal handler: keep shutdown work minimal and async-signal-safe while
+// forcing blocking LSAPI/HTTP syscalls to return promptly.
 void signal_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
+        const int server_socket = g_server_socket;
+        g_server_socket = -1;
         g_shutdown.store(true, std::memory_order_relaxed);
-        // Shutdown the listening socket to unblock accept()
-        if (g_server_socket >= 0) {
-            shutdown(g_server_socket, SHUT_RDWR);
+        LSAPI_Stop();
+        shutdown_tracked_lsapi_fds();
+        if (server_socket >= 0) {
+            shutdown(server_socket, SHUT_RDWR);
+            close(server_socket);
         }
     }
 }
@@ -1027,14 +1042,112 @@ void signal_handler(int sig) {
 //  LSAPI application process.  LiteSpeed web server connects to lswasm
 //  via the LSAPI protocol instead of HTTP.
 //
-//  The LSAPI accept loop is synchronous (no epoll/thread-pool).  Each
-//  accepted request is processed inline via the same WASM filter chain
-//  used by the HTTP path, but I/O goes through LsapiResponseSink.
+//  A single accept thread receives complete LSAPI requests and dispatches
+//  them onto the internal worker thread pool.  Each worker owns one
+//  LSAPI_Request for the lifetime of that request and responds through
+//  LsapiResponseSink using the same WASM filter chain as the HTTP path.
 // ═══════════════════════════════════════════════════════════════════════
 
 #include "lsapi_response_sink.h"
 
 namespace {
+
+int reserve_tracked_lsapi_fd_slot() {
+    for (size_t i = 0; i < MAX_TRACKED_LSAPI_FDS; ++i) {
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&g_tracked_lsapi_fds[i], &expected, -1,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return static_cast<int>(i);
+        }
+    }
+    LOG_ERROR("[LSAPI] Exhausted tracked request-fd slots; shutdown may block");
+    return -1;
+}
+
+void publish_tracked_lsapi_fd(int slot, int fd) {
+    if (slot >= 0) {
+        __atomic_store_n(&g_tracked_lsapi_fds[slot], fd, __ATOMIC_RELEASE);
+    }
+}
+
+void clear_tracked_lsapi_fd(int slot) {
+    if (slot >= 0) {
+        __atomic_store_n(&g_tracked_lsapi_fds[slot], 0, __ATOMIC_RELEASE);
+    }
+}
+
+void shutdown_tracked_lsapi_fds() {
+    for (size_t i = 0; i < MAX_TRACKED_LSAPI_FDS; ++i) {
+        const int fd = __atomic_load_n(&g_tracked_lsapi_fds[i], __ATOMIC_ACQUIRE);
+        if (fd > 0) {
+            shutdown(fd, SHUT_RDWR);
+        }
+    }
+}
+
+class LsapiRequestOwner {
+public:
+    explicit LsapiRequestOwner(int listen_fd) {
+        tracked_fd_slot_ = reserve_tracked_lsapi_fd_slot();
+        if (LSAPI_InitRequest(&req_, listen_fd) != 0) {
+            clear_tracked_lsapi_fd(tracked_fd_slot_);
+            throw std::runtime_error("[LSAPI] LSAPI_InitRequest() failed");
+        }
+        initialized_ = true;
+    }
+
+    ~LsapiRequestOwner() { cleanup(); }
+
+    LsapiRequestOwner(const LsapiRequestOwner &) = delete;
+    LsapiRequestOwner &operator=(const LsapiRequestOwner &) = delete;
+
+    LSAPI_Request *request() { return &req_; }
+
+    void markAccepted() {
+        request_active_ = true;
+        publish_tracked_lsapi_fd(tracked_fd_slot_, req_.m_fd);
+    }
+
+    void finishRequest() {
+        if (!initialized_ || !request_active_) {
+            return;
+        }
+        clear_tracked_lsapi_fd(tracked_fd_slot_);
+        LSAPI_End_Response_r(&req_);
+        request_active_ = false;
+    }
+
+private:
+    void cleanup() {
+        clear_tracked_lsapi_fd(tracked_fd_slot_);
+        if (!initialized_) {
+            return;
+        }
+        if (request_active_) {
+            LSAPI_End_Response_r(&req_);
+            request_active_ = false;
+        }
+        if (req_.m_fd != -1) {
+            close(req_.m_fd);
+            req_.m_fd = -1;
+        }
+        LSAPI_Release_r(&req_);
+        if (req_.m_pRespBuf) {
+            std::free(req_.m_pRespBuf);
+            req_.m_pRespBuf = nullptr;
+        }
+        if (req_.m_pIovec) {
+            std::free(req_.m_pIovec);
+            req_.m_pIovec = nullptr;
+        }
+        initialized_ = false;
+    }
+
+    LSAPI_Request req_{};
+    int tracked_fd_slot_ = -1;
+    bool initialized_ = false;
+    bool request_active_ = false;
+};
 
 // LSAPI_ForeachHeader_r callback: accumulate headers into HeaderPairs.
 int lsapi_header_cb(const char *key, int keyLen,
@@ -1249,12 +1362,14 @@ void lsapi_handle_request(LSAPI_Request *req) {
 /// Run the LSAPI accept loop.  Blocks until the web server closes the
 /// connection or the process is terminated.
 ///
-/// Module loading is deferred to after LSAPI_Prefork_Accept_r() returns
-/// in the child process.  This ensures the WASM runtime (V8, Wasmtime,
-/// WasmEdge, etc.) is initialised entirely within the child, avoiding
-/// fork-safety issues with JIT compiler threads that do not survive fork.
+/// In LSAPI mode, the WASM runtime is initialised once up front in this
+/// process.  When LSAPI provides a listener socket, lswasm accepts requests
+/// on one thread and dispatches them to the worker pool.  When LSAPI instead
+/// provides a single connected channel, requests are handled serially on that
+/// channel because there is no independent listener to accept from.
 int run_lsapi_loop(const std::string &wasm_module_path,
-                   const std::unordered_map<std::string, std::string> &wasm_envs) {
+                   const std::unordered_map<std::string, std::string> &wasm_envs,
+                   size_t num_workers) {
     LOG_INFO("[LSAPI] Initializing LSAPI...");
     if (LSAPI_Init() < 0) {
         LOG_ERROR("[LSAPI] LSAPI_Init() failed");
@@ -1262,32 +1377,97 @@ int run_lsapi_loop(const std::string &wasm_module_path,
     }
     LSAPI_Init_Env_Parameters(nullptr);
 
-    bool module_loaded = false;
+    const int listen_fd = g_req.m_fdListen;
+    const int connected_fd = g_req.m_fd;
+    if (listen_fd < 0 && connected_fd < 0) {
+        LOG_ERROR("[LSAPI] No listener or connected fd available after LSAPI_Init()");
+        return 1;
+    }
+    g_server_socket = (listen_fd >= 0) ? listen_fd : connected_fd;
 
-    LOG_INFO("[LSAPI] Entering accept loop...");
-    while (LSAPI_Prefork_Accept_r(&g_req) >= 0) {
-        if (g_shutdown.load(std::memory_order_relaxed)) break;
-
-        // Deferred module loading: on the first request in this child
-        // process, create the WasmModuleManager and load the module.
-        if (!module_loaded) {
-            g_module_manager = std::make_unique<WasmModuleManager>();
-            if (!wasm_envs.empty()) {
-                g_module_manager->setEnvironmentVariables(wasm_envs);
-            }
-            std::string module_name = "custom_filter";
-            LOG_INFO("[LSAPI] Loading WASM module (post-fork): " << wasm_module_path);
-            if (!g_module_manager->loadModule(wasm_module_path, module_name)) {
-                LOG_ERROR("[LSAPI] Failed to load WASM module — returning 500 for this and all subsequent requests");
-                LSAPI_Finish_r(&g_req);
-                break;
-            }
-            LOG_INFO("[LSAPI] ✓ WASM module loaded successfully in child process");
-            module_loaded = true;
+    g_module_manager = std::make_unique<WasmModuleManager>();
+    if (!wasm_envs.empty()) {
+        LOG_INFO("[LSAPI] WASM environment variables:");
+        for (const auto &[key, value] : wasm_envs) {
+            LOG_INFO("[LSAPI]   " << key << "=" << value);
         }
+        g_module_manager->setEnvironmentVariables(wasm_envs);
+    }
 
-        lsapi_handle_request(&g_req);
-        LSAPI_Finish_r(&g_req);
+    {
+        std::string module_name = "custom_filter";
+        LOG_INFO("[LSAPI] Loading WASM filter module: " << wasm_module_path);
+        if (!g_module_manager->loadModule(wasm_module_path, module_name)) {
+            LOG_ERROR("[LSAPI] Failed to load WASM module");
+            g_module_manager.reset();
+            return 1;
+        }
+        LOG_INFO("[LSAPI] ✓ Filter module loaded successfully");
+    }
+
+    try {
+        LOG_INFO("[LSAPI] Entering accept loop...");
+        if (listen_fd >= 0) {
+            ThreadPool pool(num_workers);
+            LOG_INFO("[LSAPI] Listener mode detected; thread pool started with "
+                     << pool.size() << " workers");
+
+            while (!g_shutdown.load(std::memory_order_relaxed)) {
+                auto req = std::make_shared<LsapiRequestOwner>(listen_fd);
+                if (LSAPI_Accept_r(req->request()) < 0) {
+                    if (!g_shutdown.load(std::memory_order_relaxed)) {
+                        LOG_ERROR("[LSAPI] LSAPI_Accept_r() failed");
+                    }
+                    break;
+                }
+                if (g_shutdown.load(std::memory_order_relaxed) || !LSAPI_IsRunning() ||
+                    req->request()->m_fd == -1) {
+                    break;
+                }
+
+                req->markAccepted();
+                pool.submit([req]() {
+                    try {
+                        lsapi_handle_request(req->request());
+                    } catch (const std::exception &e) {
+                        LOG_ERROR("[LSAPI] Request processing threw exception: " << e.what());
+                    } catch (...) {
+                        LOG_ERROR("[LSAPI] Request processing threw unknown exception");
+                    }
+                    req->finishRequest();
+                });
+            }
+
+            LOG_INFO("[LSAPI] Draining thread pool...");
+            pool.shutdown();
+        } else {
+            LOG_INFO("[LSAPI] Connected-channel mode detected; processing requests serially");
+            while (!g_shutdown.load(std::memory_order_relaxed)) {
+                if (LSAPI_Accept_r(&g_req) < 0) {
+                    if (!g_shutdown.load(std::memory_order_relaxed)) {
+                        LOG_ERROR("[LSAPI] LSAPI_Accept_r() failed");
+                    }
+                    break;
+                }
+                if (g_shutdown.load(std::memory_order_relaxed) || !LSAPI_IsRunning() ||
+                    g_req.m_fd == -1) {
+                    break;
+                }
+
+                try {
+                    lsapi_handle_request(&g_req);
+                } catch (const std::exception &e) {
+                    LOG_ERROR("[LSAPI] Request processing threw exception: " << e.what());
+                } catch (...) {
+                    LOG_ERROR("[LSAPI] Request processing threw unknown exception");
+                }
+                LSAPI_End_Response_r(&g_req);
+            }
+        }
+    } catch (const std::exception &e) {
+        LOG_ERROR("[LSAPI] Error: " << e.what());
+        g_module_manager.reset();
+        return 1;
     }
 
     LOG_INFO("[LSAPI] Accept loop exited.");
@@ -1415,24 +1595,20 @@ int main(int argc, char *argv[]) {
     LOG_INFO("  • proxy-wasm-spec");
     LOG_INFO("==============================\n");
 
-    // Register signal handlers.
-    {
-        struct sigaction sa{};
-        sa.sa_handler = signal_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;  // No SA_RESTART – we want epoll_wait/accept to return EINTR.
-        sigaction(SIGINT, &sa, nullptr);
-        sigaction(SIGTERM, &sa, nullptr);
-    }
+    struct sigaction sa {};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  // No SA_RESTART – we want blocking syscalls to return EINTR.
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     // ── Branch on transport mode ──────────────────────────────────────────
     if (lsapi_mode) {
-        // LSAPI transport — synchronous accept loop, no thread pool.
-        // Module loading is deferred to after LSAPI_Prefork_Accept_r() forks
-        // so each child process creates a fresh WASM runtime, avoiding
-        // fork-safety issues with JIT threads (V8, Wasmtime, WasmEdge).
-        LOG_INFO("Starting LSAPI transport mode (deferred module loading)...");
-        return run_lsapi_loop(wasm_module_path, wasm_envs);
+        // LSAPI transport — single-process runtime initialization.
+        // Listener-based LSAPI setups use threaded dispatch; direct-channel
+        // LSAPI setups fall back to serial request processing.
+        LOG_INFO("Starting LSAPI transport mode...");
+        return run_lsapi_loop(wasm_module_path, wasm_envs, num_workers);
     }
 
     // ── HTTP transport mode (default) ─────────────────────────────────────
