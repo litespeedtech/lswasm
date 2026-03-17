@@ -33,6 +33,9 @@ Makefile
 # Third-party source downloads
 third_party/wasmtime-src/
 
+# Local WAMR source tree (symlink or manual clone)
+third_party/wasm-micro-runtime
+
 # macOS
 .DS_Store
 

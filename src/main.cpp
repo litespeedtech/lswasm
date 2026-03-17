@@ -103,6 +103,7 @@ int reserve_tracked_lsapi_fd_slot();
 void publish_tracked_lsapi_fd(int slot, int fd);
 void clear_tracked_lsapi_fd(int slot);
 void shutdown_tracked_lsapi_fds();
+bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm = 0666);
 } // anonymous namespace
 
 // ── lswasm_send_response_headers ──
@@ -668,8 +669,26 @@ private:
             }
         }
 
-        // Remove any stale socket file.
-        ::unlink(uds_path_.c_str());
+        // Remove any pre-existing socket path before bind(). This lets
+        // standalone LSPROXY mode recover from stale UDS files left behind by
+        // an earlier crash or forced stop.
+        {
+            std::error_code ec;
+            if (std::filesystem::exists(uds_path_, ec)) {
+                if (::unlink(uds_path_.c_str()) != 0) {
+                    LOG_ERROR("Failed to remove existing Unix domain socket path "
+                              << uds_path_ << ": " << strerror(errno));
+                    close(server_socket_);
+                    return false;
+                }
+                LOG_INFO("Removed existing Unix domain socket path " << uds_path_);
+            } else if (ec) {
+                LOG_ERROR("Failed to inspect Unix domain socket path "
+                          << uds_path_ << ": " << ec.message());
+                close(server_socket_);
+                return false;
+            }
+        }
 
         sockaddr_un server_addr{};
         server_addr.sun_family = AF_UNIX;
@@ -686,10 +705,17 @@ private:
 
         if (bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
                  sizeof(server_addr)) < 0) {
-            LOG_ERROR("Failed to bind Unix domain socket at " << uds_path_
-                      << ": " << strerror(errno));
-            close(server_socket_);
-            return false;
+            if (errno == EADDRINUSE && ::unlink(uds_path_.c_str()) == 0 &&
+                bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
+                     sizeof(server_addr)) == 0) {
+                LOG_INFO("Removed stale Unix domain socket path and retried bind: "
+                         << uds_path_);
+            } else {
+                LOG_ERROR("Failed to bind Unix domain socket at " << uds_path_
+                          << ": " << strerror(errno));
+                close(server_socket_);
+                return false;
+            }
         }
 
         // Set socket file permissions (configurable via --sock-perm, default 0666).
@@ -1036,11 +1062,11 @@ void signal_handler(int sig) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  LSAPI transport mode
+//  LSAPI transport mode (default)
 //
-//  When --lsapi is specified on the command line, lswasm operates as an
-//  LSAPI application process.  LiteSpeed web server connects to lswasm
-//  via the LSAPI protocol instead of HTTP.
+//  Unless --lsproxy is specified on the command line, lswasm operates as an
+//  LSAPI application process. LiteSpeed/OpenLiteSpeed connects to lswasm
+//  via the LSAPI protocol instead of the standalone LSPROXY listener.
 //
 //  A single accept thread receives complete LSAPI requests and dispatches
 //  them onto the internal worker thread pool.  Each worker owns one
@@ -1083,6 +1109,38 @@ void shutdown_tracked_lsapi_fds() {
             shutdown(fd, SHUT_RDWR);
         }
     }
+}
+
+bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm) {
+    if (listen_fd < 0) {
+        return true;
+    }
+
+    sockaddr_un addr{};
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(listen_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len) != 0) {
+        LOG_ERROR("[LSAPI] getsockname() failed for listener socket: " << strerror(errno));
+        return false;
+    }
+
+    if (addr.sun_family != AF_UNIX) {
+        return true;
+    }
+
+    if (addr.sun_path[0] == '\0') {
+        LOG_INFO("[LSAPI] Listener is using an abstract Unix socket; skipping chmod");
+        return true;
+    }
+
+    if (chmod(addr.sun_path, sock_perm) != 0) {
+        LOG_ERROR("[LSAPI] Failed to set permissions on LSAPI Unix socket "
+                  << addr.sun_path << ": " << strerror(errno));
+        return false;
+    }
+
+    LOG_INFO("[LSAPI] Set permissions on LSAPI Unix socket " << addr.sun_path
+             << " to " << std::oct << static_cast<unsigned>(sock_perm) << std::dec);
+    return true;
 }
 
 class LsapiRequestOwner {
@@ -1383,6 +1441,9 @@ int run_lsapi_loop(const std::string &wasm_module_path,
         LOG_ERROR("[LSAPI] No listener or connected fd available after LSAPI_Init()");
         return 1;
     }
+    if (listen_fd >= 0 && !ensure_lsapi_listener_socket_permissions(listen_fd)) {
+        return 1;
+    }
     g_server_socket = (listen_fd >= 0) ? listen_fd : connected_fd;
 
     g_module_manager = std::make_unique<WasmModuleManager>();
@@ -1489,7 +1550,9 @@ int main(int argc, char *argv[]) {
     std::unordered_map<std::string, std::string> wasm_envs;
     bool debug = false;
     bool port_specified = false;
-    bool lsapi_mode = false;
+    bool uds_specified = false;
+    bool sock_perm_specified = false;
+    bool lsapi_mode = true;
     size_t num_workers = 0;  // 0 = auto (hardware_concurrency)
 
     // Parse command line arguments
@@ -1500,6 +1563,7 @@ int main(int argc, char *argv[]) {
             port_specified = true;
         } else if (arg == "--uds" && i + 1 < argc) {
             uds_path = argv[++i];
+            uds_specified = true;
         } else if (arg == "--sock-perm" && i + 1 < argc) {
             const char *val = argv[++i];
             char *endptr = nullptr;
@@ -1509,6 +1573,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             sock_perm = static_cast<mode_t>(parsed);
+            sock_perm_specified = true;
         } else if (arg == "--module" && i + 1 < argc) {
             wasm_module_path = argv[++i];
         } else if (arg == "--env" && i + 1 < argc) {
@@ -1524,8 +1589,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (arg == "--workers" && i + 1 < argc) {
             num_workers = static_cast<size_t>(std::stoi(argv[++i]));
-        } else if (arg == "--lsapi") {
-            lsapi_mode = true;
+        } else if (arg == "--lsproxy") {
+            lsapi_mode = false;
         } else if (arg == "--body-pacifier") {
             g_body_pacifier = true;
         } else if (arg == "--debug") {
@@ -1538,30 +1603,29 @@ int main(int argc, char *argv[]) {
                       << " — WASM HTTP Proxy Server with Proxy-WASM Support\n";
             std::cout << "Usage: " << argv[0] << " --module <path> [options]\n";
             std::cout << "Options:\n";
-            std::cout << "  --port PORT      : Listen on TCP port (instead of UDS)\n";
-            std::cout << "  --uds PATH       : Listen on Unix domain socket (default: "
+            std::cout << "  --port PORT      : Listen on TCP port in LSPROXY mode (instead of UDS)\n";
+            std::cout << "  --uds PATH       : Unix domain socket path for LSPROXY mode (default: "
                       << DEFAULT_UDS_PATH << ")\n";
-            std::cout << "  --sock-perm MODE : Set UDS file permissions in octal (default: 0666)\n";
+            std::cout << "  --sock-perm MODE : Set LSPROXY UDS file permissions in octal (default: 0666)\n";
             std::cout << "  --module PATH    : Load WASM filter module (required)\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
             std::cout << "  --workers N      : Number of worker threads (default: hardware_concurrency)\n";
-            std::cout << "  --lsapi          : Use LSAPI transport (instead of HTTP)\n";
-            std::cout << "  --body-pacifier  : Include diagnostic body in HTTP responses\n";
+            std::cout << "  --lsproxy        : Switch from default LSAPI mode to standalone LSPROXY mode\n";
+            std::cout << "  --body-pacifier  : Include diagnostic body in generated responses\n";
             std::cout << "  --debug          : Enable debug logging to "
                       << lswasm_log::LOG_PATH << "\n";
             std::cout << "  --version        : Show version number\n";
             std::cout << "  --help           : Show this help message\n";
-            std::cout << "\nBy default, listens on UDS at " << DEFAULT_UDS_PATH << ".\n";
-            std::cout << "Use --port to listen on TCP instead. "
+            std::cout << "\nBy default, lswasm runs in LSAPI mode.\n";
+            std::cout << "Use --lsproxy for standalone UDS/TCP LSPROXY mode. "
                       << "When both --port and --uds are given, only --uds is used.\n";
-            std::cout << "Use --lsapi for LSAPI transport mode (used by LiteSpeed web server).\n";
             return 0;
         }
     }
 
-    // Validate --lsapi mutual exclusion with HTTP-only options.
-    if (lsapi_mode && port_specified) {
-        std::cerr << "Error: --lsapi and --port are mutually exclusive.\n";
+    // Validate LSAPI-vs-LSPROXY option usage.
+    if (lsapi_mode && (port_specified || sock_perm_specified || uds_specified)) {
+        std::cerr << "Error: --port, --sock-perm, and --uds require --lsproxy.\n";
         return 1;
     }
 
@@ -1577,7 +1641,7 @@ int main(int argc, char *argv[]) {
 
     // Print runtime information
     LOG_INFO("\n=== lswasm " << LSWASM_VERSION << " ===");
-    LOG_INFO("Transport: " << (lsapi_mode ? "LSAPI" : "HTTP"));
+    LOG_INFO("Transport: " << (lsapi_mode ? "LSAPI" : "LSPROXY"));
 #if defined(WASM_RUNTIME_WASMTIME)
     LOG_INFO("✓ Wasmtime runtime enabled");
 #elif defined(WASM_RUNTIME_V8)
@@ -1604,14 +1668,14 @@ int main(int argc, char *argv[]) {
 
     // ── Branch on transport mode ──────────────────────────────────────────
     if (lsapi_mode) {
-        // LSAPI transport — single-process runtime initialization.
+        // LSAPI transport (default) — single-process runtime initialization.
         // Listener-based LSAPI setups use threaded dispatch; direct-channel
         // LSAPI setups fall back to serial request processing.
         LOG_INFO("Starting LSAPI transport mode...");
         return run_lsapi_loop(wasm_module_path, wasm_envs, num_workers);
     }
 
-    // ── HTTP transport mode (default) ─────────────────────────────────────
+    // ── LSPROXY transport mode (--lsproxy) ────────────────────────────────
     // Initialize WASM module manager and load the module eagerly (no fork).
     g_module_manager = std::make_unique<WasmModuleManager>();
 
@@ -1634,14 +1698,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // ── HTTP transport mode (default) ────────────────────────────────────
+    // ── LSPROXY transport mode (--lsproxy) ────────────────────────────────
     // Create thread pool for worker threads.
     ThreadPool pool(num_workers);
     LOG_INFO("Thread pool started with " << pool.size() << " workers");
 
     try {
-        // Create server: default to UDS; use TCP only if --port was explicitly
-        // given without a custom --uds override.
+        // Create standalone LSPROXY listener: default to UDS; use TCP only if
+        // --port was explicitly given without a custom --uds override.
         std::unique_ptr<HttpServer> server;
         bool explicit_uds = (uds_path != DEFAULT_UDS_PATH);
         if (explicit_uds || !port_specified) {

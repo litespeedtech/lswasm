@@ -2,24 +2,51 @@
 
 **Version 1.0.0** · [Changelog](CHANGES.md)
 
-A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using proxy-wasm-cpp-host, with support for **Wasmtime**, **V8**, **WasmEdge**, and **WAMR** runtimes.
+A C++ agent that executes WebAssembly (WASM) filter modules via
+[proxy-wasm-cpp-host](https://github.com/proxy-wasm/proxy-wasm-cpp-host),
+with support for **Wasmtime**, **V8**, **WasmEdge**, and **WAMR** runtimes.  It is designed with LiteSpeed Server products in mind (LiteSpeed Enterprise and OpenLiteSpeed).
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+  - [System Dependencies](#system-dependencies)
+  - [WASM Runtimes](#wasm-runtimes)
+- [Building](#building)
+- [Running](#running)
+  - [Command-Line Reference](#command-line-reference)
+  - [LSAPI Mode (default)](#lsapi-transport-mode)
+  - [Standalone LSPROXY Mode](#standalone-lsproxy-mode)
+- [Installing / Upgrading / Uninstalling](#installing-the-binary)
+- [Configuring LiteSpeed](#configuring-litespeed)
+- [Streaming Response API](#streaming-response-api)
+- [Testing](#testing)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+- [Contributing](#contributing)
+- [References](#references)
+
+---
 
 ## Features
 
-- **Multi-threaded** `epoll`-based HTTP server (Linux) with configurable worker thread pool (`--workers N`)
-- **LSAPI transport mode** for running behind LiteSpeed/OpenLiteSpeed with `--lsapi`
-- Thread-local WASM VM cloning via proxy-wasm-cpp-host's `getOrCreateThreadLocalPlugin()` — each worker thread gets its own VM instance
-- TCP and **Unix domain socket** listeners for standalone HTTP mode
-- WASM filter module loading and execution via proxy-wasm-cpp-host
-- HTTP filter chain with short-circuit on local responses (`sendLocalResponse`)
-- **Response header manipulation** from WASM modules via proxy-wasm ABI
-- **Streaming response API** — WASM modules can send streaming HTTP responses over both standalone HTTP and LSAPI transports via foreign functions (`lswasm_send_response_headers`, `lswasm_write_response_chunk`, `lswasm_finish_response`)
-- Support for Wasmtime, V8, WasmEdge, and WAMR runtimes (selectable via `-DWASM_RUNTIME=`)
-- Per-module environment variables (`--env KEY=VALUE`)
-- Reader-writer locked metrics (atomic counters/gauges) and reader-writer locked module registry
-- Thread-safe logging
-- Graceful shutdown with signal handling (SIGINT, SIGTERM) and ordered thread pool drain
-- Modular CMake-based build system
+| Category | Description |
+|----------|-------------|
+| **LSAPI transport** | Default mode for LiteSpeed / OpenLiteSpeed integration |
+| **Standalone LSPROXY** | UDS/TCP listener activated with `--lsproxy` |
+| **Thread pool** | Configurable worker threads (`--workers N`) |
+| **Multiple runtimes** | Wasmtime, V8, WasmEdge, WAMR — selectable at build time (`-DWASM_RUNTIME=`) |
+| **Per-module env vars** | `--env KEY=VALUE` (repeatable) |
+| **Concurrency** | Reader-writer locked metrics and module registry; thread-local WASM VM cloning via `getOrCreateThreadLocalPlugin()` |
+| **Header manipulation** | WASM modules can modify response headers via the proxy-wasm ABI |
+| **Streaming responses** | Foreign functions (`lswasm_send_response_headers`, `lswasm_write_response_chunk`, `lswasm_finish_response`) over both HTTP and LSAPI transports |
+| **CMake build** | Modular CMake-based build system with per-runtime detection |
+
+---
 
 ## Architecture
 
@@ -27,78 +54,93 @@ A C++ HTTP proxy server that can execute WebAssembly (WASM) filter modules using
 lswasm/
 ├── CMakeLists.txt                  # Main build configuration
 ├── README.md                       # This file
+├── CHANGES.md                      # Changelog
 ├── .gitmodules                     # Git submodule configuration
-├── install.sh                      # Install lswasm as a systemd user service
-├── upgrade.sh                      # Automated upgrade (pull, build, restart)
-├── uninstall.sh                    # Remove service and installed binary
+├── install.sh                      # Install the lswasm binary and save metadata
+├── upgrade.sh                      # Automated upgrade (pull, build, replace binary)
+├── uninstall.sh                    # Remove installed binary and saved metadata
+│
 ├── src/
 │   ├── main.cpp                    # HTTP server (epoll loop, CLI, thread pool dispatch)
 │   ├── http_filter.h               # HTTP filter context (per-request WASM scopes)
 │   ├── connection_io.h             # Worker ↔ epoll bridge for streaming I/O
 │   ├── http_utils.h                # HTTP utility functions (header serialization, etc.)
+│   ├── response_sink.h             # Transport-abstract response interface
+│   ├── http_response_sink.h        # ResponseSink for epoll/HTTP (chunked transfer)
+│   ├── lsapi_response_sink.h       # ResponseSink for LSAPI transport
 │   ├── wasm_module_manager.h       # WASM module manager (thread-local VM cloning)
 │   ├── wasm_module_manager.cc      # WASM module manager implementation
 │   ├── thread_pool.h               # Fixed-size worker thread pool
 │   ├── log.h                       # Thread-safe debug logging (file-based, --debug flag)
-│   └── hash_shim.cc                # Hash helper shim
+│   ├── hash_shim.cc                # Hash helper shim
+│   ├── lsapidef.h                  # LSAPI protocol definitions (C)
+│   ├── lsapilib.h                  # LSAPI library header (C)
+│   └── lsapilib.c                  # LSAPI library implementation (C)
+│
 ├── samples/
 │   ├── include/
 │   │   └── lswasm_streaming.h      # SDK-side convenience header for streaming API
-│   ├── sample_filter/
-│   │   ├── sample_filter.cpp       # Example WASM filter (C++ source)
-│   │   ├── CMakeLists.txt          # Build rules for sample_filter
-│   │   └── README.md               # Sample documentation
-│   ├── send_recv_all/
-│   │   ├── send_recv_all.cpp       # Buffered send/receive sample (C++ source)
-│   │   ├── CMakeLists.txt          # Build rules for send_recv_all
-│   │   └── README.md               # Sample documentation
-│   └── send_recv_stream/
-│       ├── send_recv_stream.cpp    # Streaming response sample (C++ source)
-│       ├── CMakeLists.txt          # Build rules for send_recv_stream
-│       └── README.md               # Sample documentation
+│   ├── sample_filter/              # Basic WASM filter example
+│   ├── send_recv_all/              # Buffered send/receive sample
+│   └── send_recv_stream/           # Streaming response sample
+│
 ├── cmake/
 │   └── wasm32-wasi-toolchain.cmake # Toolchain file for building WASM modules
+│
 ├── third_party/
 │   ├── proxy-wasm-cpp-host/        # WASM host library (git submodule)
 │   ├── proxy-wasm-cpp-sdk/         # WASM SDK (git submodule)
 │   └── proxy-wasm-spec/            # WASM spec (git submodule)
+│
 └── build*/                         # Build output directories (gitignored)
 ```
 
-### Submodule Integration
-
-The `proxy-wasm-cpp-host` is included as a git submodule at `third_party/proxy-wasm-cpp-host/`. This provides:
-- Core WASM module loading and execution
-- Proxy-WASM ABI implementation
-- Support for multiple WASM runtimes
+---
 
 ## Prerequisites
 
 ### System Dependencies
 
+**Ubuntu / Debian:**
+
 ```bash
-# Ubuntu/Debian
 sudo apt-get update
 sudo apt-get install -y build-essential cmake git libssl-dev pkg-config cargo
+```
 
-# macOS
+**Red Hat / AlmaLinux / Rocky Linux:**
+
+```bash
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y cmake git openssl-devel pkg-config cargo
+```
+
+**macOS:**
+
+```bash
 brew install cmake openssl pkg-config rust
 ```
 
 ### WASM Runtimes
 
-#### Wasmtime (Default)
+Choose **one** runtime to build against.  The runtime is selected at CMake
+configure time with `-DWASM_RUNTIME=<name>`.
+
+#### Wasmtime (default)
 
 CMake first tries `find_package(wasmtime)` for a system-installed library.
 If that fails it looks for a source build in `third_party/wasmtime-src/`.
 
-**Option A — System install (Ubuntu/Debian):**
+<details>
+<summary><strong>Option A — System install (Ubuntu/Debian)</strong></summary>
 
 ```bash
 sudo apt-get install -y libwasmtime-dev
 ```
+</details>
 
-**Option B — Build from source into `third_party/`:**
+<details>
+<summary><strong>Option B — Build from source into <code>third_party/</code></strong></summary>
 
 ```bash
 git clone https://github.com/bytecodealliance/wasmtime.git third_party/wasmtime-src
@@ -111,6 +153,7 @@ This produces the C API headers under
 `third_party/wasmtime-src/crates/c-api/include/` and the library at
 `third_party/wasmtime-src/target/release/libwasmtime.a`, which CMake
 detects automatically.
+</details>
 
 #### V8
 
@@ -119,79 +162,91 @@ detects automatically.
 > *not* sufficient because proxy-wasm-cpp-host uses internal V8 headers
 > (e.g. `src/wasm/c-api.h`) that are not shipped with Node.js.
 
-##### Building V8 from source
+<details>
+<summary><strong>Building V8 from source</strong></summary>
 
-Follow the instructions here to install depot_tools, and getting the source tree: https://v8.dev/docs/source-code
-In the v8 directory, run:
-```
+Follow the [V8 source code guide](https://v8.dev/docs/source-code) to install
+`depot_tools` and fetch the source tree. Then in the `v8` directory:
+
+```bash
 gn gen out/wee8 --args='
-  is_debug=false 
-  v8_symbol_level=1 
-  is_component_build=false 
-  v8_enable_i18n_support=false 
-  v8_use_external_startup_data=false 
-  v8_monolithic=true 
+  is_debug=false
+  v8_symbol_level=1
+  is_component_build=false
+  v8_enable_i18n_support=false
+  v8_use_external_startup_data=false
+  v8_monolithic=true
   target_cpu="x64"
-  v8_enable_sandbox=false 
+  v8_enable_sandbox=false
 '
 autoninja -C out/wee8 wee8
 ```
-This is a time-consuming process.
 
-> **Note:** Adjust arguments as needed for your specific platform (e.g., `"arm64"`).
+> Adjust `target_cpu` for your platform (e.g. `"arm64"`).
 
-This produces `out/wee8/obj/libwee8.a` (~120 MB, monolithic archive
-containing V8, ICU, zlib, and all dependencies).
+This produces `out/wee8/obj/libwee8.a` (~120 MB monolithic archive containing
+V8, ICU, zlib, and all dependencies).
 
-Refer to the [official V8 build guide](https://v8.dev/docs/build) for
+See the [official V8 build guide](https://v8.dev/docs/build) for
 platform-specific prerequisites and troubleshooting.
+</details>
 
-##### V8 toolchain requirements
+<details>
+<summary><strong>V8 toolchain requirements</strong></summary>
 
-V8 builds with its own bundled **Clang** compiler and **libc++** (with a custom
-ABI namespace `__Cr`). To link against `libwee8.a`, lswasm **must** be compiled
-with the same toolchain:
+V8 builds with its own bundled **Clang** and **libc++** (custom ABI namespace
+`__Cr`). To link against `libwee8.a`, lswasm **must** use the same toolchain:
 
-- **Compiler:** V8's bundled Clang at `<V8_ROOT>/third_party/llvm-build/Release+Asserts/bin/clang++`
-- **Linker:** V8's bundled `lld` (auto-detected by CMake from the V8 tree)
-- **C++ stdlib:** V8's bundled libc++ headers and static archives (auto-detected)
-- **C++ standard:** C++20 (required by V8 ≥ 14.x headers; set automatically)
+| Component | Path |
+|-----------|------|
+| Compiler | `<V8_ROOT>/third_party/llvm-build/Release+Asserts/bin/clang++` |
+| Linker | V8's bundled `lld` (auto-detected by CMake) |
+| C++ stdlib | V8's bundled libc++ headers and static archives (auto-detected) |
+| C++ standard | C++20 (required by V8 ≥ 14.x; set automatically) |
 
-The CMake build system handles all of these automatically when `V8_ROOT` is
-set — you only need to point `CMAKE_CXX_COMPILER` at V8's Clang.
+CMake handles all of this when `V8_ROOT` is set — just point
+`CMAKE_CXX_COMPILER` at V8's Clang.
+</details>
 
-##### V8 link dependencies
+<details>
+<summary><strong>V8 link dependencies</strong></summary>
 
-Modern V8 (≥ 14.7) uses Rust for the ECMAScript Temporal API. The CMake build
+Modern V8 (≥ 14.7) uses Rust for the ECMAScript Temporal API. CMake
 automatically extracts all required `.rlib` and `.a` dependencies from V8's
 `wee8.ninja` build file, including:
 
-- ICU (i18n, unicode), zlib, partition_alloc
-- ~55 Rust `.rlib` archives (temporal_rs, icu_calendar, diplomat_runtime, etc.)
+- ICU (i18n, unicode), zlib, partition\_alloc
+- ~55 Rust `.rlib` archives (temporal\_rs, icu\_calendar, diplomat\_runtime, etc.)
 - Rust standard library sysroot archives
 - `libclang_rt.builtins.a`
+</details>
 
 #### WasmEdge
 
 WasmEdge is a lightweight, high-performance WebAssembly runtime optimized for
 cloud-native, edge, and decentralized applications.
 
-CMake first tries pkg-config, then searches system paths, `~/.wasmedge/`,
-and `third_party/wasmedge/`.
+CMake first tries pkg-config, then searches system paths, `~/.wasmedge/`, and
+`third_party/wasmedge/`.
 
-**Option A — Quick install (Linux/macOS):**
+<details>
+<summary><strong>Option A — Quick install (Linux/macOS)</strong></summary>
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
 ```
+</details>
 
-**Option B — System install (Ubuntu/Debian):**
+<details>
+<summary><strong>Option B — System install (Ubuntu/Debian)</strong></summary>
 
 ```bash
 sudo apt-get install -y wasmedge
 ```
+</details>
 
-**Option C — Build from source into `third_party/`:**
+<details>
+<summary><strong>Option C — Build from source into <code>third_party/</code></strong></summary>
 
 ```bash
 git clone https://github.com/WasmEdge/WasmEdge.git third_party/wasmedge-src
@@ -202,8 +257,9 @@ cmake --install build --prefix ../../third_party/wasmedge
 cd ../..
 ```
 
-This places headers in `third_party/wasmedge/include/` and the library
-in `third_party/wasmedge/lib/`, which CMake detects automatically.
+Headers go to `third_party/wasmedge/include/` and the library to
+`third_party/wasmedge/lib/`; CMake detects both automatically.
+</details>
 
 #### WAMR (WebAssembly Micro Runtime)
 
@@ -211,11 +267,12 @@ CMake first tries pkg-config, then searches system paths and
 `third_party/wamr/` or `third_party/wasm-micro-runtime/`.
 
 > **Important:** WAMR must be built with `-DWAMR_BUILD_LIBC_WASI=0`.
-> proxy-wasm-cpp-host supplies its own WASI function stubs; WAMR's
-> built-in WASI implementation conflicts with them and causes
-> `_initialize` to trap with `unreachable`.
+> proxy-wasm-cpp-host supplies its own WASI function stubs; WAMR's built-in
+> WASI implementation conflicts with them and causes `_initialize` to trap
+> with `unreachable`.
 
-**Option A — System install:**
+<details>
+<summary><strong>Option A — System install</strong></summary>
 
 ```bash
 git clone https://github.com/bytecodealliance/wasm-micro-runtime.git
@@ -225,8 +282,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_LIBC_WASI=0
 cmake --build . -j$(nproc)
 sudo cmake --install .
 ```
+</details>
 
-**Option B — Build from source into `third_party/`:**
+<details>
+<summary><strong>Option B — Build from source into <code>third_party/</code></strong></summary>
 
 ```bash
 git clone https://github.com/bytecodealliance/wasm-micro-runtime.git \
@@ -238,44 +297,43 @@ cmake --build . -j$(nproc)
 cd ../../../../../..
 ```
 
-This places the headers in
-`third_party/wasm-micro-runtime/core/iwasm/include/` and the library at
-`third_party/wasm-micro-runtime/product-mini/platforms/linux/build/`,
-which CMake detects automatically.
+Headers land in `third_party/wasm-micro-runtime/core/iwasm/include/` and the
+library at `third_party/wasm-micro-runtime/product-mini/platforms/linux/build/`;
+CMake detects both automatically.
+</details>
+
+---
 
 ## Building
 
-### 1. Clone with Submodules
+### 1. Clone with submodules
 
 ```bash
-git clone <project-url>
+git clone https://github.com/litespeedtech/lswasm.git
 cd lswasm
 git submodule update --init --recursive
 ```
 
-### 2. Create Build Directory
+### 2. Create a build directory
 
 ```bash
-mkdir build
-cd build
+mkdir build && cd build
 ```
 
-### 3. Configure and Build
+### 3. Configure and build
 
-#### With Wasmtime (Default)
+Pick the runtime that matches the one you installed above.
+
+#### Wasmtime (default)
 
 ```bash
-cmake .. \
-  -DWASM_RUNTIME=wasmtime \
-  -DCMAKE_BUILD_TYPE=Release
-
+cmake .. -DWASM_RUNTIME=wasmtime -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
 ```
 
-#### With V8 (from source tree)
+#### V8
 
 ```bash
-# Point at V8's bundled Clang compiler and the V8 source tree.
 V8_ROOT=~/v8
 
 cmake .. \
@@ -287,372 +345,30 @@ cmake .. \
 cmake --build . -j$(nproc)
 ```
 
-#### With WasmEdge
+#### WasmEdge
 
 ```bash
-cmake .. \
-  -DWASM_RUNTIME=wasmedge \
-  -DCMAKE_BUILD_TYPE=Release
-
+cmake .. -DWASM_RUNTIME=wasmedge -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
 ```
 
-#### With WAMR
+#### WAMR
 
 ```bash
-cmake .. \
-  -DWASM_RUNTIME=wamr \
-  -DCMAKE_BUILD_TYPE=Release
-
+cmake .. -DWASM_RUNTIME=wamr -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
 ```
 
-## Upgrading
-
-To upgrade an existing lswasm installation to a newer version:
-
-### Automated Upgrade (Recommended)
-
-If lswasm was installed via `install.sh`, the `upgrade.sh` script automates
-the entire process — pull, submodule update, clean rebuild, stop service,
-copy binary, and restart:
-
-```bash
-cd lswasm
-./upgrade.sh
-```
-
-Pass CMake options with `--cmake-args`:
-
-```bash
-./upgrade.sh --cmake-args "-DWASM_RUNTIME=wamr -DCMAKE_BUILD_TYPE=Release"
-```
-
-| Flag | Description |
-|------|-------------|
-| `--build-dir <path>` | Build directory (default: `build`) |
-| `--cmake-args <args>` | Additional CMake configure arguments (quoted string, e.g., `"-DWASM_RUNTIME=wamr -DCMAKE_BUILD_TYPE=Release"`) |
-| `--no-clean` | Incremental build instead of clean rebuild |
-| `--no-pull` | Skip `git pull` (use local source as-is) |
-| `--service-name <name>` | Override the systemd unit name |
-
-### Re-installing with install.sh
-
-You can also re-run `install.sh` with the same arguments as the original
-install.  If an existing binary is detected at the install location, the
-script automatically stops the running service before copying the new binary
-and restarts it afterward.
-
-### Manual Upgrade
-
-#### 1. Check the Changelog
-
-Review [CHANGES.md](CHANGES.md) for breaking changes, new features, and
-migration notes before upgrading.
-
-#### 2. Pull Latest Changes
-
-```bash
-cd lswasm
-git pull
-```
-
-#### 3. Update Submodules
-
-The `proxy-wasm-cpp-host` submodule may have been updated. Always sync and
-update submodules after pulling:
-
-```bash
-git submodule sync --recursive
-git submodule update --init --recursive
-```
-
-#### 4. Rebuild
-
-A clean rebuild is recommended after upgrading, especially when submodules
-or build configuration have changed:
-
-```bash
-# Remove the old build directory and start fresh
-rm -rf build
-mkdir build
-cd build
-
-# Configure (use the same options as your original build)
-cmake .. \
-  -DWASM_RUNTIME=wasmtime \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build . -j$(nproc)
-```
-
-If you prefer an in-place reconfigure instead of a full clean build:
-
-```bash
-cd build
-cmake --fresh ..
-cmake --build . -j$(nproc)
-```
-
-> **Tip:** If the WASM runtime version on your system has changed (e.g. a
-> Wasmtime or V8 upgrade), you should always do a clean rebuild to avoid
-> link errors from stale cached artefacts.
-
-## Running
-
-### Basic Usage
-
-```bash
-./lswasm --module samples/sample_filter/sample_filter.wasm
-```
-
-The `--module` flag is **required** — lswasm will exit with an error if no
-WASM filter module is specified.
-
-By default, lswasm runs in standalone HTTP mode and listens on a Unix domain
-socket at `/tmp/lswasm.sock` using `std::thread::hardware_concurrency()`
-worker threads (or 4 if detection fails).
-
-### Custom Worker Count
-
-```bash
-# Use 8 worker threads
-./lswasm --module filter.wasm --workers 8
-```
-
-### Custom TCP Port
-
-```bash
-./lswasm --module filter.wasm --port 9000
-```
-
-### Custom Unix Domain Socket Path
-
-```bash
-./lswasm --module filter.wasm --uds /var/run/lswasm.sock
-```
-
-When both `--port` and `--uds` are given, only `--uds` is used.
-
-### LSAPI Transport Mode
-
-```bash
-./lswasm --module filter.wasm --lsapi
-```
-
-Use `--lsapi` to run lswasm as an LSAPI application process for
-LiteSpeed/OpenLiteSpeed instead of exposing the standalone HTTP listener.
-In this mode, LiteSpeed communicates with lswasm over the LSAPI protocol,
-and lswasm uses [`LsapiResponseSink`](src/lsapi_response_sink.h:29) rather than
-HTTP chunked transfer framing.
-
-Notes for `--lsapi` mode:
-
-- It is intended for LiteSpeed/OpenLiteSpeed integration.
-- `--lsapi` and `--port` are mutually exclusive.
-- The standalone HTTP listener settings (`--port`, `--uds`, `--sock-perm`,
-  `--workers`) do not apply to LSAPI transport.
-- The same WASM filter chain and streaming response API remain available.
-
-### Passing Environment Variables to WASM Modules
-
-```bash
-./lswasm --module samples/sample_filter/sample_filter.wasm --env MY_KEY=my_value --env ANOTHER=val
-```
-
-### Help
-
-```bash
-./lswasm --help
-```
-
-### Command-Line Reference
-
-| Option | Argument | Description |
-|--------|----------|-------------|
-| `--port` | `PORT` | Listen on a TCP port instead of a Unix domain socket (standalone HTTP mode only) |
-| `--uds` | `PATH` | Listen on a Unix domain socket (default: `/tmp/lswasm.sock`) in standalone HTTP mode |
-| `--sock-perm` | `MODE` | Set UDS file permissions in octal (default: `0666`) for standalone HTTP mode |
-| `--module` | `PATH` | **(required)** Load a WASM filter module |
-| `--env` | `KEY=VALUE` | Set an environment variable for WASM modules (repeatable) |
-| `--workers` | `N` | Number of worker threads (default: `hardware_concurrency()` or 4) in standalone HTTP mode |
-| `--lsapi` | — | Use LSAPI transport instead of the standalone HTTP listener |
-| `--body-pacifier` | — | Include a diagnostic body in HTTP responses (request info, runtime, filters) |
-| `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
-| `--version` | — | Print version number and exit |
-| `--help` | — | Show usage information and exit |
-
-When both `--port` and `--uds` are given, only `--uds` is used.
-By default (without `--lsapi`), lswasm listens on the UDS path.
-`--lsapi` and `--port` are mutually exclusive.
-
-## Installing as a Service
-
-lswasm ships with `install.sh` and `uninstall.sh` scripts that set up (or
-tear down) a **systemd user service** so lswasm starts automatically when
-you log in.
-
-### Install
-
-```bash
-./install.sh \
-  --bin ./build/lswasm \
-  --install-dir /opt/lswasm \
-  -- --module /etc/lswasm/filter.wasm --uds /run/lswasm.sock --debug
-```
-
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--bin <path>` | Yes | Path to the compiled lswasm binary |
-| `--install-dir <path>` | Yes | Directory where the binary will be copied |
-| `--service-name <name>` | No | systemd unit name (default: `lswasm.service`) |
-| `-- <args …>` | No | All arguments after `--` are forwarded to lswasm's `ExecStart` |
-
-If `--module` or `--uds` are not present in the forwarded arguments, the
-script prompts interactively.
-
-After a successful install:
-
-```bash
-systemctl --user status lswasm.service
-journalctl --user -u lswasm.service -f
-```
-
-### Uninstall
-
-```bash
-./uninstall.sh
-```
-
-Or with a custom service name:
-
-```bash
-./uninstall.sh --service-name my-lswasm.service
-```
-
-The uninstall script:
-1. Stops and disables the systemd user service.
-2. Removes the unit file and reloads systemd.
-3. Deletes the installed binary.
-4. Removes the install directory if it is empty.
-
-## Starting and Stopping the Service
-
-### systemd User Service
-
-If you installed lswasm via [`install.sh`](install.sh), it runs as a **systemd user service** that starts automatically on login.
-
-**Start** the service:
-
-```bash
-systemctl --user start lswasm.service
-```
-
-**Stop** the service:
-
-```bash
-systemctl --user stop lswasm.service
-```
-
-**Restart** the service (e.g. after updating a WASM module or changing configuration):
-
-```bash
-systemctl --user restart lswasm.service
-```
-
-**Check status:**
-
-```bash
-systemctl --user status lswasm.service
-```
-
-**View logs:**
-
-```bash
-journalctl --user -u lswasm.service -f
-```
-
-**Disable** the service from starting on login:
-
-```bash
-systemctl --user disable lswasm.service
-```
-
-**Re-enable** it:
-
-```bash
-systemctl --user enable lswasm.service
-```
-
-> **Note:** If you used a custom `--service-name` during installation, replace
-> `lswasm.service` with that name in the commands above.
-
-### Standalone (without systemd)
-
-When running lswasm directly from the command line, stop it with
-**Ctrl+C** (sends `SIGINT`) or by sending `SIGTERM`:
-
-```bash
-# Start in the foreground:
-./lswasm --module samples/sample_filter/sample_filter.wasm --port 8080
-
-# Stop with Ctrl+C, or from another terminal:
-kill $(pidof lswasm)
-```
-
-lswasm handles both `SIGINT` and `SIGTERM` for graceful shutdown — it stops
-accepting new connections, drains the worker thread pool (waiting for
-in-flight requests to complete), cleans up the Unix domain socket (if used),
-destroys WASM module state, and exits.
-
-## Testing
-
-By default, lswasm listens on a **Unix domain socket** at `/tmp/lswasm.sock`.
-Use `--port` to switch to TCP mode for direct `curl` testing.
-
-### Basic Health Check
-
-```bash
-# Start with the default UDS listener:
-./lswasm --module samples/sample_filter/sample_filter.wasm
-
-# In another terminal:
-curl --unix-socket /tmp/lswasm.sock http://localhost/
-```
-
-### Basic Health Check (TCP mode)
-
-```bash
-# Start with TCP listener:
-./lswasm --module samples/sample_filter/sample_filter.wasm --port 8080
-
-# In another terminal:
-curl http://localhost:8080/
-
-# Output:
-# WASM HTTP Proxy Server
-# Method: GET
-# Path: /
-# Version: HTTP/1.1
-# Runtime: Wasmtime
-```
-
-### With netcat (TCP mode)
-
-```bash
-echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
-```
-
-## Build Configuration
-
-The CMakeLists.txt provides the following options:
-
-- `WASM_RUNTIME` (string) - WASM runtime to use: `wasmtime` (default), `v8`, `wasmedge`, `wamr`, or empty string for Null VM
-- `V8_ROOT` (path) - Path to V8 source tree (required when `WASM_RUNTIME=v8`)
-- `V8_BUILD_DIR` (path) - V8 build output directory (default: `V8_ROOT/out/wee8`)
-- `CMAKE_BUILD_TYPE` - Release or Debug build
-
-Build output will show the selected runtime:
+### Build configuration variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `WASM_RUNTIME` | string | `wasmtime` (default), `v8`, `wasmedge`, `wamr`, or `""` (Null VM) |
+| `V8_ROOT` | path | Path to V8 source tree (required when `WASM_RUNTIME=v8`) |
+| `V8_BUILD_DIR` | path | V8 build output directory (default: `V8_ROOT/out/wee8`) |
+| `CMAKE_BUILD_TYPE` | string | `Release` or `Debug` |
+
+A successful configure prints:
 
 ```
 === WASM Proxy Build Configuration ===
@@ -661,96 +377,241 @@ Runtime found: TRUE
 =========================================
 ```
 
-## Configuring LiteSpeed
+---
 
-To configure LiteSpeed (Enterprise or OpenLiteSpeed) there are many ways to do it.  lswasm supports two integration models:
+## Running
 
-- **Standalone HTTP mode** (default): lswasm runs as a separate HTTP server over UDS/TCP and LiteSpeed proxies requests to it.
-- **LSAPI mode** (`--lsapi`): lswasm runs as an LSAPI application process and speaks the LSAPI protocol directly.
+### Command-Line Reference
 
-The instructions below describe the standalone HTTP proxy setup. If you want LiteSpeed to launch lswasm directly as an LSAPI app, run lswasm with `--lsapi` and configure it as an LSAPI external application instead of a web-server proxy target.
+| Option | Argument | Description |
+|--------|----------|-------------|
+| `--module` | `PATH` | **(required)** Path to the WASM filter module |
+| `--lsproxy` | — | Switch from default LSAPI mode to standalone LSPROXY mode |
+| `--port` | `PORT` | TCP port for standalone LSPROXY mode (instead of UDS) |
+| `--uds` | `PATH` | Unix domain socket path for LSPROXY mode (default: `/tmp/lswasm.sock`) |
+| `--sock-perm` | `MODE` | UDS file permissions in octal (default: `0666`); LSPROXY only |
+| `--env` | `KEY=VALUE` | Environment variable for WASM modules (repeatable) |
+| `--workers` | `N` | Worker thread count (default: `hardware_concurrency()` or 4) |
+| `--body-pacifier` | — | Include a diagnostic body in generated responses |
+| `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
+| `--version` | — | Print version and exit |
+| `--help` | — | Show usage and exit |
 
-These standalone HTTP instructions assume:
+> When both `--port` and `--uds` are given, only `--uds` is used.
+> `--port`, `--uds`, and `--sock-perm` all require `--lsproxy`.
 
-- An overall configuration.  This will work with OpenLiteSpeed and in LiteSpeed Enterprise in non-Apache mode.  In Apache mode, you will want to setup rewrite files to it.
-- You are just testing it out and thus will use the sample application (from above).
-- You will copy the sample application to the root of your server's Virtual Host directory ($LSWS_HOME/DEFAULT/html/ for LiteSpeed Enterprise's default Virtual Host or $LSWS_HOME/Example/html/ for OpenLiteSpeed's default Virtual Host).
-
-Many users will configure it for processing a particular directory on an existing listener, in which case you'd setup a Virtual Host context for it.  Or a particular port, in which case you'd configure a listener and a VirtualHost context.
-
-Navigate to: **Web Admin > Configuration > External App > Add**
-
-- Type = `Web Server`.  Press the **Next** button
-- Name = `wasm`.  A sample name that you can remember.
-- Address = `uds://tmp/lswasm.sock`.  The default UDS address.  If during the install you configured it to be installed elsewhere or with TCP you should specify the alternate location or http://<address>:<port>.
-- Max Connections = 20.  Specifies the maximum number of concurrent connections that can be established between the server and an external application.
-- Connection Keepalive Timeout = `60`.  Specifies the maximum time in seconds to keep an idle persistent connection open.
-- Initial Request Timeout (secs) = `60`.  Specifies the maximum time in seconds the server will wait for the external application to respond to the first request over a newly established connection. 
-- Retry Timeout (secs) = `60`.  Specifies the period of time that the server waits before retrying an external application that had a prior communication problem.
-
-Press the **Save** button to save your settings.  Press the **Script Handler** tab to setup an extension handler.
-
-- Suffixes = `wasm`.  This will trigger on any file with a .wasm extension.
-- Handler Type = `Web Server`.  This is the type of handler that lswasm runs as.
-- Handler Name = `wasm`.  Enter the name from the External App above.
-
-Press the **Save** button to save your settings.  Perform a **Graceful Restart** to apply the settings.
-
-In the default case, in a browser with the default settings: `http://localhost:8088/sample_filter.wasm` will display the output of the settings.
-
-## Development
-
-### Reconfiguring After Runtime Installation
-
-If you install a new WASM runtime after the initial build, reconfigure CMake:
+### Basic usage
 
 ```bash
-cd build
-cmake --fresh ..
-cmake --build . -j$(nproc)
+# Minimal invocation (LSAPI mode):
+./lswasm --module samples/sample_filter/sample_filter.wasm
+
+# Standalone LSPROXY with default UDS:
+./lswasm --module filter.wasm --lsproxy
+
+# Standalone LSPROXY on TCP port 9000 with 8 workers:
+./lswasm --module filter.wasm --lsproxy --port 9000 --workers 8
+
+# Custom UDS path:
+./lswasm --module filter.wasm --lsproxy --uds /var/run/lswasm.sock
+
+# Pass env vars to the WASM module:
+./lswasm --module filter.wasm --env MY_KEY=my_value --env ANOTHER=val
 ```
 
-### Viewing Compiler Commands
+### LSAPI Transport Mode
 
-Check `build/compile_commands.json` for detailed compiler configurations. This can be used by IDEs and tools like clangd for better editor support.
+LSAPI mode is the **default** — no extra flags needed. LiteSpeed communicates
+with lswasm over the LSAPI protocol and lswasm uses
+[`LsapiResponseSink`](src/lsapi_response_sink.h) instead of HTTP chunked
+transfer framing.
+
+- Intended for LiteSpeed / OpenLiteSpeed integration.
+- `--port`, `--sock-perm`, and `--uds` require `--lsproxy`.
+- The same WASM filter chain and streaming response API are available.
+
+### Standalone LSPROXY Mode
+
+Use `--lsproxy` to switch to the standalone UDS/TCP listener.  In this mode
+lswasm exposes its own socket endpoint and can be used as a web-server proxy
+target.
+
+- `--port`, `--uds`, and `--sock-perm` apply only in this mode.
+- When both `--port` and `--uds` are given, only `--uds` is used.
+- `--workers` configures the standalone worker pool.
+
+---
+
+## Installing the Binary
+
+lswasm ships with three lifecycle scripts:
+
+| Script | Purpose |
+|--------|---------|
+| [`install.sh`](install.sh) | Copy the binary and save metadata for upgrades |
+| [`upgrade.sh`](upgrade.sh) | Pull, rebuild, and replace the installed binary |
+| [`uninstall.sh`](uninstall.sh) | Remove the installed binary and metadata |
+
+> These scripts manage only the binary — they do not create or manage a system
+> service.
+
+### Install
+
+```bash
+./install.sh --bin ./build/lswasm --install-dir /opt/lswasm
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--bin <path>` | Yes | Path to the compiled lswasm binary |
+| `--install-dir <path>` | Yes | Destination directory for the binary |
+
+After installing, point LiteSpeed/OpenLiteSpeed at the installed binary.  In the
+common LSAPI deployment model the web server launches lswasm on demand:
+
+```bash
+/opt/lswasm/lswasm --module /etc/lswasm/filter.wasm
+```
+
+For standalone mode, run with `--lsproxy` instead.
+
+### Upgrade
+
+```bash
+./upgrade.sh
+```
+
+The upgrade script reads the install state from
+`~/.local/state/lswasm/install-state.env` (written by `install.sh`), pulls
+the latest source, rebuilds, and replaces the installed binary.
+
+| Flag | Description |
+|------|-------------|
+| `--build-dir <path>` | Build directory (default: `build`) |
+| `--cmake-args <args>` | Additional CMake configure arguments |
+| `--no-clean` | Incremental build instead of clean rebuild |
+| `--no-pull` | Skip `git pull` (use local source as-is) |
+
+### Uninstall
+
+```bash
+./uninstall.sh
+```
+
+The uninstall script:
+1. Deletes the installed binary.
+2. Removes the install directory if it is empty.
+3. Removes the saved install metadata.
+
+---
+
+## Starting and Stopping lswasm
+
+### LiteSpeed / OpenLiteSpeed-managed (LSAPI)
+
+In the typical deployment, LiteSpeed/OpenLiteSpeed starts lswasm on demand as an
+LSAPI external app.  Start/stop behavior is managed by the web server
+configuration, not by a separate service.
+
+### Standalone (`--lsproxy`)
+
+Stop lswasm with **Ctrl+C** (`SIGINT`) or `SIGTERM`:
+
+```bash
+# Start in the foreground:
+./lswasm --lsproxy --module samples/sample_filter/sample_filter.wasm --port 8080
+
+# Stop from another terminal:
+kill $(pidof lswasm)
+```
+
+lswasm handles both signals for **graceful shutdown**: it stops accepting new
+connections, drains the worker thread pool, cleans up the Unix domain socket
+(if used), destroys WASM module state, and exits.
+
+---
+
+## Configuring LiteSpeed
+
+lswasm supports two integration models:
+
+| Model | How it works |
+|-------|-------------|
+| **LSAPI** (default) | lswasm runs as an LSAPI application process and speaks the LSAPI protocol directly. |
+| **LSPROXY** (`--lsproxy`) | lswasm runs as a separate server; LiteSpeed proxies requests to it over UDS/TCP. |
+
+The instructions below describe the **standalone LSPROXY** proxy setup.  For
+LSAPI mode, configure lswasm as an LSAPI external application instead of a
+web-server proxy target (omit `--lsproxy`).
+
+### Assumptions
+
+- OpenLiteSpeed or LiteSpeed Enterprise in non-Apache mode.
+- Using the sample filter for testing.
+- The sample `.wasm` file has been copied to the Virtual Host document root:
+  - **LiteSpeed Enterprise:** `$LSWS_HOME/DEFAULT/html/`
+  - **OpenLiteSpeed:** `$LSWS_HOME/Example/html/`
+
+> Many users will configure it for a particular directory (Virtual Host context)
+> or a particular port (listener + Virtual Host context).
+
+### Steps
+
+Navigate to **Web Admin → Configuration → External App → Add**:
+
+1. **Type** = `Web Server` → press **Next**.
+2. **Name** = `wasm` (or any memorable name).
+3. **Address** = `uds://tmp/lswasm.sock` (adjust if you used a different path
+   or TCP).
+4. **Max Connections** = `20`.
+5. **Connection Keepalive Timeout** = `60`.
+6. **Initial Request Timeout** = `60`.
+7. **Retry Timeout** = `60`.
+
+Press **Save**, then switch to the **Script Handler** tab:
+
+1. **Suffixes** = `wasm`.
+2. **Handler Type** = `Web Server`.
+3. **Handler Name** = `wasm` (the name from the External App above).
+
+Press **Save** → perform a **Graceful Restart** to apply.
+
+With the default settings, visiting
+`http://localhost:8088/sample_filter.wasm` should display the filter output.
+
+---
 
 ## Streaming Response API
 
 lswasm extends the proxy-wasm ABI with three **foreign functions** that let a
-WASM filter stream HTTP responses incrementally instead of buffering the
-entire body in a single `sendLocalResponse()` call.  This is useful for large
-payloads, server-sent events, or any scenario where constant memory usage is
-important.
+WASM filter stream HTTP responses incrementally instead of buffering the entire
+body in a single `sendLocalResponse()` call.  This is useful for large payloads,
+server-sent events, or any scenario requiring constant memory usage.
 
-### Foreign Functions
+### Foreign functions
 
 | Function | Argument | Description |
 |----------|----------|-------------|
-| `lswasm_send_response_headers` | 4-byte `uint32_t` status code + marshalled header pairs | Begin a streaming response with the given HTTP status and headers |
-| `lswasm_write_response_chunk` | Raw body bytes | Write a chunk of response body data to the client |
-| `lswasm_finish_response` | *(none)* | Signal end-of-response — no more chunks may be written |
+| `lswasm_send_response_headers` | 4-byte `uint32_t` status + marshalled header pairs | Begin a streaming response |
+| `lswasm_write_response_chunk` | Raw body bytes | Write a body chunk |
+| `lswasm_finish_response` | *(none)* | Signal end-of-response |
 
-These are invoked via `proxy_call_foreign_function()` from the proxy-wasm
-SDK.
+These are invoked via `proxy_call_foreign_function()` from the proxy-wasm SDK.
 
-On the HTTP transport, the host writes streaming responses using HTTP/1.1
-chunked transfer encoding. Header handling is normalized by the server:
+On the HTTP transport, streaming responses use **HTTP/1.1 chunked transfer
+encoding**.  The server normalizes headers automatically:
 
-- `Content-Length` is removed for streaming responses.
-- `Transfer-Encoding: chunked` is added automatically if it is not already
-  present.
+- `Content-Length` is removed.
+- `Transfer-Encoding: chunked` is added if not already present.
 - Conflicting `Transfer-Encoding` values are rejected.
 
-### C++ Convenience Header
+### C++ convenience header
 
-Include `lswasm_streaming.h` (located at `samples/include/`) in your filter
-to get typed wrappers instead of calling `proxy_call_foreign_function()`
-directly:
+Include [`lswasm_streaming.h`](samples/include/lswasm_streaming.h) in your
+filter for typed wrappers:
 
 ```cpp
 #include "lswasm_streaming.h"
-
-// In your stream context's onRequestHeaders or onRequestBody:
 
 // 1. Send response headers (starts the streaming response).
 lswasm::streaming::sendResponseHeaders(200, {
@@ -765,70 +626,140 @@ lswasm::streaming::writeResponseChunk(data, len);
 lswasm::streaming::finishResponse();
 ```
 
-### Lifecycle Rules
+### Lifecycle rules
 
-1. **`sendResponseHeaders`** must be called exactly once, before any chunks.
-2. **`writeResponseChunk`** may be called zero or more times after
-   **`sendResponseHeaders`**.
-3. **`finishResponse`** must be called exactly once after
-   **`sendResponseHeaders`** and before the request completes.
-4. Calling **`writeResponseChunk`** or **`finishResponse`** before headers are
-   sent, or calling any streaming function after the response is finished,
-   returns `WasmResult::BadArgument`.
-5. Once a streaming response starts, it becomes the terminal response path for
-   that request; the filter must finish it instead of later switching to
-   `sendLocalResponse()`.
+1. `sendResponseHeaders` — call **exactly once**, before any chunks.
+2. `writeResponseChunk` — call **zero or more** times after headers.
+3. `finishResponse` — call **exactly once** to complete the response.
+4. Calling out of order returns `WasmResult::BadArgument`.
+5. Once a streaming response starts it becomes the terminal response path;
+   the filter must finish it rather than switching to `sendLocalResponse()`.
 
-### Detecting Host Support
+### Detecting host support
 
-If your filter must run on hosts that may not support the streaming API, call
-`lswasm::streaming::isSupported()` *before* `sendResponseHeaders()`. The host
-implements this probe by recognizing a zero-argument
-`lswasm_send_response_headers` call and returning `WasmResult::BadArgument`.
-Hosts that do not register the foreign function return `WasmResult::NotFound`,
-allowing the wrapper to return `false` so you can fall back to
+If your filter may run on hosts without the streaming API, call
+`lswasm::streaming::isSupported()` *before* `sendResponseHeaders()`.  The
+host returns `WasmResult::BadArgument` for a zero-argument probe call;
+unsupported hosts return `WasmResult::NotFound`, letting you fall back to
 `sendLocalResponse()`.
 
 ### Samples
 
-- **`samples/send_recv_stream/`** — Streaming echo filter that writes each
-  request body chunk back to the client as it arrives, maintaining constant
-  memory usage regardless of body size.
-- **`samples/send_recv_all/`** — Buffered send/receive filter that
-  accumulates the entire request body and responds with a single
-  `sendLocalResponse()`.  Good for small payloads.
+| Sample | Description |
+|--------|-------------|
+| [`samples/send_recv_stream/`](samples/send_recv_stream/) | Streaming echo filter — writes each request body chunk back as it arrives |
+| [`samples/send_recv_all/`](samples/send_recv_all/) | Buffered filter — accumulates the body and responds with `sendLocalResponse()` |
 
 See each sample's `README.md` for build and usage instructions.
 
+---
+
+## Testing
+
+By default (LSPROXY mode), lswasm listens on a **Unix domain socket** at
+`/tmp/lswasm.sock`.  Use `--port` to switch to TCP mode for direct `curl`
+testing.
+
+### UDS health check
+
+```bash
+# Terminal 1:
+./lswasm --module samples/sample_filter/sample_filter.wasm --lsproxy
+
+# Terminal 2:
+curl --unix-socket /tmp/lswasm.sock http://localhost/
+```
+
+### TCP health check
+
+```bash
+# Terminal 1:
+./lswasm --module samples/sample_filter/sample_filter.wasm --lsproxy --port 8080
+
+# Terminal 2:
+curl http://localhost:8080/
+```
+
+Expected output:
+
+```
+WASM HTTP Proxy Server
+Method: GET
+Path: /
+Version: HTTP/1.1
+Runtime: Wasmtime
+```
+
+### Raw request with netcat
+
+```bash
+echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
+```
+
+---
+
+## Development
+
+### Reconfiguring after runtime installation
+
+If you install a new WASM runtime after the initial build, reconfigure CMake:
+
+```bash
+cd build
+cmake --fresh ..
+cmake --build . -j$(nproc)
+```
+
+### Viewing compiler commands
+
+`build/compile_commands.json` contains detailed compiler invocations for use by
+IDEs and tools like `clangd`.
+
+---
+
 ## Troubleshooting
 
-### Enabling lswasm logging
+### Enabling debug logging
 
-lswasm logging can be enabled by either entering the `--debug` command line option to the executable or creating the trigger file `/tmp/lswasm.dolog`.  The log is written to /tmp/lswasm.log.  Any problems you have in lswasm should start with enabling logging and examining the log.
+Debug logging is activated in either of two ways:
+
+- Pass `--debug` on the command line.
+- Create the trigger file `/tmp/lswasm.dolog`.
+
+Logs are written to `/tmp/lswasm.log`.  Start troubleshooting by enabling
+logging and examining this file.
 
 ### Verifying lswasm is working
 
-The instructions above include a [Basic Health Check](#basic-health-check).  Before relying on LiteSpeed's configuration you should verify the service is performing correctly with the basic health check.  If it is not, then enable lswasm logging and check the logs for errors.
+Use the [health checks](#testing) above before relying on the LiteSpeed
+configuration.  If they fail, enable debug logging and check the logs.
 
 ### Service output
 
-If you are running lswasm as a service, the important messages will be written to the system log files.  In most modern Linux systems, these can be examined with journalctl searching for lswasm.
+When running lswasm as a service, important messages go to the system log.  On
+most modern Linux systems:
 
-### Runtime Not Found
+```bash
+journalctl -u lswasm   # or search by process name
+```
+
+### Runtime not found
 
 ```
 -- Wasmtime not found - install via: cargo install wasmtime-cli or apt install libwasmtime-dev
 ```
 
-**Solution**: Install the missing runtime using the commands in the Prerequisites section.
+**Fix:** Install the missing runtime using the commands in the
+[Prerequisites](#wasm-runtimes) section.
 
-### CMake Not Found
+### CMake not found
 
 ```
 cmake: command not found
 ```
 
-**Solution**: Install CMake:
+**Fix:**
+
 ```bash
 # Ubuntu/Debian
 sudo apt-get install -y cmake
@@ -837,41 +768,48 @@ sudo apt-get install -y cmake
 brew install cmake
 ```
 
-### Permission Denied on Port 8080
+### Permission denied on bind
 
 ```
 Failed to bind socket to port 8080
 ```
 
-**Solution**: Use a port > 1024 or run with sudo:
+**Fix:** Use a port above 1024 or run with `sudo`:
+
 ```bash
-./lswasm --port 8000
+./lswasm --lsproxy --port 8000
 ```
 
+---
 
 ## License
 
 Copyright 2026 LiteSpeed Technologies, Inc.
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.  
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
-See http://www.gnu.org/licenses/.
+See <http://www.gnu.org/licenses/>.
+
+---
 
 ## Contributing
 
-Contributions are welcome! Please submit pull requests and issues to the project repository.
+Contributions are welcome! Please submit pull requests and issues to the
+[project repository](https://github.com/litespeedtech/lswasm).
+
+---
 
 ## References
 
 - [proxy-wasm-cpp-host](https://github.com/proxy-wasm/proxy-wasm-cpp-host)
+- [proxy-wasm-cpp-sdk](https://github.com/proxy-wasm/proxy-wasm-cpp-sdk)
 - [Wasmtime](https://docs.wasmtime.dev/)
 - [V8](https://v8.dev/)
 - [V8 Build Guide](https://v8.dev/docs/build)
