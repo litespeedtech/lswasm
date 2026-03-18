@@ -1427,7 +1427,28 @@ void lsapi_handle_request(LSAPI_Request *req) {
 /// channel because there is no independent listener to accept from.
 int run_lsapi_loop(const std::string &wasm_module_path,
                    const std::unordered_map<std::string, std::string> &wasm_envs,
-                   size_t num_workers) {
+                   size_t num_workers,
+                   const std::string &bind_addr) {
+    // If a bind address was provided, create a listener socket and dup2 it
+    // onto fd 0 so that LSAPI_Init() picks it up as the listening socket.
+    if (!bind_addr.empty()) {
+        LOG_INFO("[LSAPI] Creating listener socket on " << bind_addr);
+        int fd = LSAPI_CreateListenSock(bind_addr.c_str(), BACKLOG);
+        if (fd == -1) {
+            LOG_ERROR("[LSAPI] LSAPI_CreateListenSock(\"" << bind_addr << "\") failed");
+            return 1;
+        }
+        if (fd != 0) {
+            if (dup2(fd, 0) < 0) {
+                const int err = errno;
+                close(fd);
+                LOG_ERROR("[LSAPI] dup2(" << fd << ", 0) failed: " << strerror(err));
+                return 1;
+            }
+            close(fd);
+        }
+    }
+
     LOG_INFO("[LSAPI] Initializing LSAPI...");
     if (LSAPI_Init() < 0) {
         LOG_ERROR("[LSAPI] LSAPI_Init() failed");
@@ -1476,8 +1497,9 @@ int run_lsapi_loop(const std::string &wasm_module_path,
             while (!g_shutdown.load(std::memory_order_relaxed)) {
                 auto req = std::make_shared<LsapiRequestOwner>(listen_fd);
                 if (LSAPI_Accept_r(req->request()) < 0) {
+                    int err = errno;
                     if (!g_shutdown.load(std::memory_order_relaxed)) {
-                        LOG_ERROR("[LSAPI] LSAPI_Accept_r() failed");
+                        LOG_ERROR("[LSAPI] LSAPI_Accept_r() failed: " << strerror(err));
                     }
                     break;
                 }
@@ -1543,6 +1565,11 @@ int run_lsapi_loop(const std::string &wasm_module_path,
 // ═══════════════════════════════════════════════════════════════════════
 
 int main(int argc, char *argv[]) {
+    if (geteuid() == 0) {
+        std::cerr << "ERROR: lswasm must not be run as root." << std::endl;
+        return 1;
+    }
+
     int port = DEFAULT_PORT;
     std::string wasm_module_path;
     std::string uds_path = DEFAULT_UDS_PATH;
@@ -1553,6 +1580,7 @@ int main(int argc, char *argv[]) {
     bool uds_specified = false;
     bool sock_perm_specified = false;
     bool lsapi_mode = true;
+    std::string lsapi_bind_addr;  // Optional LSAPI listening socket address (e.g. "127.0.0.1:8000")
     size_t num_workers = 0;  // 0 = auto (hardware_concurrency)
 
     // Parse command line arguments
@@ -1589,6 +1617,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (arg == "--workers" && i + 1 < argc) {
             num_workers = static_cast<size_t>(std::stoi(argv[++i]));
+        } else if (arg == "--lsapi-addr" && i + 1 < argc) {
+            lsapi_bind_addr = argv[++i];
         } else if (arg == "--lsproxy") {
             lsapi_mode = false;
         } else if (arg == "--body-pacifier") {
@@ -1610,6 +1640,7 @@ int main(int argc, char *argv[]) {
             std::cout << "  --module PATH    : Load WASM filter module (required)\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
             std::cout << "  --workers N      : Number of worker threads (default: hardware_concurrency)\n";
+            std::cout << "  --lsapi-addr ADDR: Bind LSAPI to address (e.g. 127.0.0.1:8000 or /tmp/lswasm.sock)\n";
             std::cout << "  --lsproxy        : Switch from default LSAPI mode to standalone LSPROXY mode\n";
             std::cout << "  --body-pacifier  : Include diagnostic body in generated responses\n";
             std::cout << "  --debug          : Enable debug logging to "
@@ -1626,6 +1657,10 @@ int main(int argc, char *argv[]) {
     // Validate LSAPI-vs-LSPROXY option usage.
     if (lsapi_mode && (port_specified || sock_perm_specified || uds_specified)) {
         std::cerr << "Error: --port, --sock-perm, and --uds require --lsproxy.\n";
+        return 1;
+    }
+    if (!lsapi_mode && !lsapi_bind_addr.empty()) {
+        std::cerr << "Error: --lsapi-addr cannot be used with --lsproxy.\n";
         return 1;
     }
 
@@ -1672,7 +1707,7 @@ int main(int argc, char *argv[]) {
         // Listener-based LSAPI setups use threaded dispatch; direct-channel
         // LSAPI setups fall back to serial request processing.
         LOG_INFO("Starting LSAPI transport mode...");
-        return run_lsapi_loop(wasm_module_path, wasm_envs, num_workers);
+        return run_lsapi_loop(wasm_module_path, wasm_envs, num_workers, lsapi_bind_addr);
     }
 
     // ── LSPROXY transport mode (--lsproxy) ────────────────────────────────

@@ -36,7 +36,7 @@ with support for **Wasmtime**, **V8**, **WasmEdge**, and **WAMR** runtimes.  It 
 
 | Category | Description |
 |----------|-------------|
-| **LSAPI transport** | Default mode for LiteSpeed / OpenLiteSpeed integration |
+| **LSAPI transport** | Default mode for LiteSpeed / OpenLiteSpeed integration.  It can be started by LiteSpeed or stand-alone. |
 | **Standalone LSPROXY** | UDS/TCP listener activated with `--lsproxy` |
 | **Thread pool** | Configurable worker threads (`--workers N`) |
 | **Multiple runtimes** | Wasmtime, V8, WasmEdge, WAMR — selectable at build time (`-DWASM_RUNTIME=`) |
@@ -386,6 +386,7 @@ Runtime found: TRUE
 | Option | Argument | Description |
 |--------|----------|-------------|
 | `--module` | `PATH` | **(required)** Path to the WASM filter module |
+| `--lsapi-addr` | `ADDR` | Bind LSAPI to a specific address (e.g. `127.0.0.1:8000` or `/tmp/lswasm.sock`); LSAPI only |
 | `--lsproxy` | — | Switch from default LSAPI mode to standalone LSPROXY mode |
 | `--port` | `PORT` | TCP port for standalone LSPROXY mode (instead of UDS) |
 | `--uds` | `PATH` | Unix domain socket path for LSPROXY mode (default: `/tmp/lswasm.sock`) |
@@ -399,12 +400,16 @@ Runtime found: TRUE
 
 > When both `--port` and `--uds` are given, only `--uds` is used.
 > `--port`, `--uds`, and `--sock-perm` all require `--lsproxy`.
+> `--lsapi-addr` requires LSAPI mode (cannot be combined with `--lsproxy`).
 
 ### Basic usage
 
 ```bash
 # Minimal invocation (LSAPI mode):
 ./lswasm --module samples/sample_filter/sample_filter.wasm
+
+# LSAPI mode with explicit listening address:
+./lswasm --module filter.wasm --lsapi-addr 127.0.0.1:8000
 
 # Standalone LSPROXY with default UDS:
 ./lswasm --module filter.wasm --lsproxy
@@ -421,14 +426,20 @@ Runtime found: TRUE
 
 ### LSAPI Transport Mode
 
-LSAPI mode is the **default** — no extra flags needed. LiteSpeed communicates
-with lswasm over the LSAPI protocol and lswasm uses
-[`LsapiResponseSink`](src/lsapi_response_sink.h) instead of HTTP chunked
-transfer framing.
+LSAPI mode is the **default** and is the recommended communications mode when using a LiteSpeed server.
 
-- Intended for LiteSpeed / OpenLiteSpeed integration.
-- `--port`, `--sock-perm`, and `--uds` require `--lsproxy`.
-- The same WASM filter chain and streaming response API are available.
+By default, the LSAPI listening socket is inherited from the parent process
+(e.g. LiteSpeed) and that is the recommended method.  Use `--lsapi-addr` to create a listening socket on an
+explicit address instead.  The address can be a TCP `host:port` pair or a
+Unix domain socket path:
+
+```bash
+# TCP listener
+./lswasm --module filter.wasm --lsapi-addr 127.0.0.1:8000
+
+# UDS listener
+./lswasm --module filter.wasm --lsapi-addr /tmp/lswasm_lsapi.sock
+```
 
 ### Standalone LSPROXY Mode
 
@@ -438,7 +449,6 @@ target.
 
 - `--port`, `--uds`, and `--sock-perm` apply only in this mode.
 - When both `--port` and `--uds` are given, only `--uds` is used.
-- `--workers` configures the standalone worker pool.
 
 ---
 
@@ -453,12 +463,12 @@ lswasm ships with three lifecycle scripts:
 | [`uninstall.sh`](uninstall.sh) | Remove the installed binary and metadata |
 
 > These scripts manage only the binary — they do not create or manage a system
-> service.
+> service or the required module.
 
 ### Install
 
 ```bash
-./install.sh --bin ./build/lswasm --install-dir /opt/lswasm
+./install.sh --bin ./build/lswasm --install-dir /usr/local/lsws/fcgi-bin
 ```
 
 | Flag | Required | Description |
@@ -470,7 +480,7 @@ After installing, point LiteSpeed/OpenLiteSpeed at the installed binary.  In the
 common LSAPI deployment model the web server launches lswasm on demand:
 
 ```bash
-/opt/lswasm/lswasm --module /etc/lswasm/filter.wasm
+/usr/local/lsws/fcgi-bin/lswasm --module /usr/local/lsws/fcgi-bin/sample_filter.wasm
 ```
 
 For standalone mode, run with `--lsproxy` instead.
@@ -505,32 +515,6 @@ The uninstall script:
 
 ---
 
-## Starting and Stopping lswasm
-
-### LiteSpeed / OpenLiteSpeed-managed (LSAPI)
-
-In the typical deployment, LiteSpeed/OpenLiteSpeed starts lswasm on demand as an
-LSAPI external app.  Start/stop behavior is managed by the web server
-configuration, not by a separate service.
-
-### Standalone (`--lsproxy`)
-
-Stop lswasm with **Ctrl+C** (`SIGINT`) or `SIGTERM`:
-
-```bash
-# Start in the foreground:
-./lswasm --lsproxy --module samples/sample_filter/sample_filter.wasm --port 8080
-
-# Stop from another terminal:
-kill $(pidof lswasm)
-```
-
-lswasm handles both signals for **graceful shutdown**: it stops accepting new
-connections, drains the worker thread pool, cleans up the Unix domain socket
-(if used), destroys WASM module state, and exits.
-
----
-
 ## Configuring LiteSpeed
 
 lswasm supports two integration models:
@@ -540,38 +524,40 @@ lswasm supports two integration models:
 | **LSAPI** (default) | lswasm runs as an LSAPI application process and speaks the LSAPI protocol directly. |
 | **LSPROXY** (`--lsproxy`) | lswasm runs as a separate server; LiteSpeed proxies requests to it over UDS/TCP. |
 
-The instructions below describe the **standalone LSPROXY** proxy setup.  For
-LSAPI mode, configure lswasm as an LSAPI external application instead of a
-web-server proxy target (omit `--lsproxy`).
+The instructions below describe the **LSAPI** setup.  For
+LSPROXY mode, configure lswasm as a Web Server instead of a
+LSAPI target (and add `--lsproxy`).  You will also need to create a service or other external method to pre-load it.
 
 ### Assumptions
 
 - OpenLiteSpeed or LiteSpeed Enterprise in non-Apache mode.
 - Using the sample filter for testing.
-- The sample `.wasm` file has been copied to the Virtual Host document root:
-  - **LiteSpeed Enterprise:** `$LSWS_HOME/DEFAULT/html/`
-  - **OpenLiteSpeed:** `$LSWS_HOME/Example/html/`
+- Both `lswasm` and the sample filter: `sample_filter.wasm` have been copied to the $SERVER_ROOT/fcgi-bin/ directory, typically `/usr/local/lsws/fcgi-bin`.
 
-> Many users will configure it for a particular directory (Virtual Host context)
-> or a particular port (listener + Virtual Host context).
+> Many users will configure the filter for a particular directory (Virtual Host context), often the user's or application's home directory.
 
 ### Steps
 
 Navigate to **Web Admin → Configuration → External App → Add**:
 
-1. **Type** = `Web Server` → press **Next**.
-2. **Name** = `wasm` (or any memorable name).
-3. **Address** = `uds://tmp/lswasm.sock` (adjust if you used a different path
-   or TCP).
-4. **Max Connections** = `20`.
-5. **Connection Keepalive Timeout** = `60`.
-6. **Initial Request Timeout** = `60`.
-7. **Retry Timeout** = `60`.
+- **Type** = `LSAPI App` → press **Next**.
+- **Name** = `wasm` (or any memorable name).
+- **Address** = `uds://tmp/lswasm.sock` (adjust if you used a different path
+   or TCP).  This must be unique for each external app.
+- **Max Connections** = `1`.
+- **Environment** = `LSAPI_CHILDREN=20`.
+- **Initial Request Timeout** = `60`.
+- **Retry Timeout** = `0`.
+- **Connection Keepalive Timeout** = `60`.
+- **Start By Server** = `Yes (Through CGI Daemon)`
+- **Command** = For OLS: `$SERVER_ROOT/fcgi-bin/lswasm --module $SERVER_ROOT/fcgi-bin/sample_filter.wasm`.
+- **Instances** = `1`.
+- **Run On Startup** = `Yes (Detached Mode)`.
 
 Press **Save**, then switch to the **Script Handler** tab:
 
 1. **Suffixes** = `wasm`.
-2. **Handler Type** = `Web Server`.
+2. **Handler Type** = `LiteSpeed SAPI`.
 3. **Handler Name** = `wasm` (the name from the External App above).
 
 Press **Save** → perform a **Graceful Restart** to apply.
@@ -723,7 +709,7 @@ IDEs and tools like `clangd`.
 
 Debug logging is activated in either of two ways:
 
-- Pass `--debug` on the command line.
+- Pass `--debug` on the command line used to start lswasm.
 - Create the trigger file `/tmp/lswasm.dolog`.
 
 Logs are written to `/tmp/lswasm.log`.  Start troubleshooting by enabling
@@ -734,14 +720,9 @@ logging and examining this file.
 Use the [health checks](#testing) above before relying on the LiteSpeed
 configuration.  If they fail, enable debug logging and check the logs.
 
-### Service output
+### LiteSpeed output
 
-When running lswasm as a service, important messages go to the system log.  On
-most modern Linux systems:
-
-```bash
-journalctl -u lswasm   # or search by process name
-```
+Check the LiteSpeed error logs.  If running in LiteSpeed mode, these will be error.log and stderr.log in /usr/local/lsws/logs.  If you are running in Apache mode, these are typically in the /var/log/apache2 directory.
 
 ### Runtime not found
 
@@ -774,7 +755,7 @@ brew install cmake
 Failed to bind socket to port 8080
 ```
 
-**Fix:** Use a port above 1024 or run with `sudo`:
+**Fix:** Use a port above 1024:
 
 ```bash
 ./lswasm --lsproxy --port 8000
