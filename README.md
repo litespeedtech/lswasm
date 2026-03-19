@@ -402,6 +402,8 @@ Runtime found: TRUE
 > `--port`, `--uds`, and `--sock-perm` all require `--lsproxy`.
 > `--lsapi-addr` requires LSAPI mode (cannot be combined with `--lsproxy`).
 
+> lswasm needs to be run as a non-root user.
+
 ### Basic usage
 
 ```bash
@@ -562,8 +564,10 @@ Press **Save**, then switch to the **Script Handler** tab:
 
 Press **Save** → perform a **Graceful Restart** to apply.
 
-With the default settings, visiting
-`http://localhost:8088/sample_filter.wasm` should display the filter output.
+To run a test you will need to create a .wasm file in the default vhost directory.  A simple way to do this would be to use the `touch` command:
+- LiteSpeed Enterprise: `touch /usr/local/lsws/DEFAULT/html`.  Test with curl using: `curl http://127.0.0.1:8088/test.wasm`
+- OpenLiteSpeed: `touch /usr/local/lsws/Example/html`.  Test with curl using: `curl http://127.0.0.1:8088/html/test.wasm`
+
 
 ---
 
@@ -669,11 +673,24 @@ curl http://localhost:8080/
 Expected output:
 
 ```
-WASM HTTP Proxy Server
-Method: GET
-Path: /
-Version: HTTP/1.1
-Runtime: Wasmtime
+=== Environment Variables ===
+
+Environment variable count: 0
+
+(no environment variables set)
+
+
+=== Request Headers ===
+
+Header count: 7
+
+  :method: GET
+  :path: /
+  :scheme: http
+  :authority: localhost
+  Host: localhost
+  User-Agent: curl/8.5.0
+  Accept: */*
 ```
 
 ### Raw request with netcat
