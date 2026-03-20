@@ -23,6 +23,9 @@ with support for **Wasmtime**, **V8**, **WasmEdge**, and **WAMR** runtimes.  It 
 - [Installing / Upgrading / Uninstalling](#installing-the-binary)
 - [Configuring LiteSpeed](#configuring-litespeed)
 - [Streaming Response API](#streaming-response-api)
+- [Performance](#performance)
+  - [WAMR AOT Precompilation](#wamr-aot-precompilation)
+  - [WasmEdge AOT Precompilation](#wasmedge-aot-precompilation)
 - [Testing](#testing)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
@@ -641,6 +644,182 @@ unsupported hosts return `WasmResult::NotFound`, letting you fall back to
 | [`samples/send_recv_all/`](samples/send_recv_all/) | Buffered filter — accumulates the body and responds with `sendLocalResponse()` |
 
 See each sample's `README.md` for build and usage instructions.
+
+---
+
+## Performance
+
+### WAMR AOT Precompilation
+
+By default, WAMR executes WASM modules in **interpreter mode**, which can be
+significantly slower than native code.  For production deployments,
+**Ahead-of-Time (AOT) compilation** eliminates interpreter overhead by
+converting WASM bytecode to native machine code at build time.
+
+> **Note:** This section applies only to the **WAMR** runtime.  Wasmtime and V8
+> use JIT compilation natively and do not require a separate AOT step.  For
+> **WasmEdge** AOT, see the [WasmEdge AOT section](#wasmedge-aot-precompilation)
+> below.  The embedded AOT custom sections are safely ignored by runtimes that
+> don't recognize them.
+
+#### 1. Build the WAMR AOT compiler (`wamrc`)
+
+`wamrc` ships with the WAMR source tree and requires LLVM to build:
+
+```bash
+# Install LLVM (Ubuntu/Debian)
+sudo apt-get install -y llvm-18-dev libclang-18-dev lld-18
+
+# Build wamrc
+cd third_party/wasm-micro-runtime/wamr-compiler
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+cmake --build . -j$(nproc)
+```
+
+This produces `third_party/wasm-micro-runtime/wamr-compiler/build/wamrc`.
+
+#### 2. AOT-compile your WASM module
+
+```bash
+# Compile to native code for the current platform
+./third_party/wasm-micro-runtime/wamr-compiler/build/wamrc \
+  --opt-level=3 \
+  --output=my_filter.aot \
+  my_filter.wasm
+```
+
+Common `wamrc` flags:
+
+| Flag | Description |
+|------|-------------|
+| `--opt-level=N` | Optimization level (0–3; default 3) |
+| `--target=TRIPLE` | Target triple (e.g. `x86_64`); defaults to host |
+| `--cpu=NAME` | Target CPU (e.g. `generic`, `znver2`, `skylake`) |
+| `--output=FILE` | Output `.aot` file path |
+
+#### 3. Embed the AOT code in the WASM file
+
+The AOT binary must be embedded as a WebAssembly custom section named
+`"wamr-aot"` inside the original `.wasm` file.  A helper script is provided:
+
+```bash
+python3 tools/append_aot_to_wasm.py my_filter.wasm my_filter.aot my_filter_aot.wasm
+```
+
+This produces a single `.wasm` file containing both the original bytecode
+(for portability) and the native AOT code (for WAMR performance).  The
+resulting file works with **all** runtimes — non-WAMR runtimes simply ignore
+the custom section.
+
+#### 4. Deploy the AOT-enabled WASM file
+
+Replace your deployed `.wasm` module with the AOT-embedded version:
+
+```bash
+cp my_filter_aot.wasm /usr/local/lsws/fcgi-bin/my_filter.wasm
+```
+
+No changes to the lswasm command line or LiteSpeed configuration are needed —
+lswasm automatically detects and uses the `"wamr-aot"` custom section at
+startup when running with the WAMR runtime.
+
+#### Quick reference (end-to-end)
+
+```bash
+# Build (one-time)
+wamrc --opt-level=3 --output=filter.aot filter.wasm
+
+# Embed AOT in WASM
+python3 tools/append_aot_to_wasm.py filter.wasm filter.aot filter_aot.wasm
+
+# Deploy
+cp filter_aot.wasm /usr/local/lsws/fcgi-bin/filter.wasm
+```
+
+### WasmEdge AOT Precompilation
+
+By default, WasmEdge executes WASM modules in **interpreter mode**.  For
+production deployments, `wasmedgec` compiles WASM to native code in a
+"universal WASM" format that WasmEdge loads and executes natively.
+
+Unlike WAMR (which produces a raw `.aot` binary that must be embedded as a
+custom section), WasmEdge's `wasmedgec` produces a **valid `.wasm` file** with
+native code embedded alongside the original bytecode.  This means the output
+can be used directly with `--module` — no extra embedding step is needed.
+
+#### 1. AOT-compile with `wasmedgec`
+
+`wasmedgec` ships with any standard WasmEdge installation:
+
+```bash
+# Install WasmEdge (if not already installed)
+curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
+
+# AOT-compile to "universal WASM" format
+~/.wasmedge/bin/wasmedgec my_filter.wasm my_filter_aot.wasm
+```
+
+The output `my_filter_aot.wasm` is a valid WASM file with native code
+embedded — WasmEdge will detect and use it automatically.
+
+#### 2. Deploy
+
+Simply pass the AOT-compiled file to lswasm:
+
+```bash
+cp my_filter_aot.wasm /usr/local/lsws/fcgi-bin/my_filter.wasm
+```
+
+That's it — no custom section embedding required.
+
+#### Quick reference (end-to-end)
+
+```bash
+# AOT compile (one-time)
+wasmedgec filter.wasm filter_aot.wasm
+
+# Deploy
+cp filter_aot.wasm /usr/local/lsws/fcgi-bin/filter.wasm
+```
+
+<details>
+<summary>Advanced: Cross-runtime WASM files with both WAMR and WasmEdge AOT</summary>
+
+For deployments where the same `.wasm` file must work optimally with multiple
+runtimes, lswasm also supports embedding the WasmEdge universal WASM as a
+`"wasmedge-aot"` custom section.  When running with the WasmEdge runtime,
+lswasm extracts this section automatically.
+
+```bash
+# Build WAMR AOT
+wamrc --opt-level=3 --output=filter.aot filter.wasm
+
+# Build WasmEdge AOT
+wasmedgec filter.wasm filter_wasmedge_aot.wasm
+
+# Embed WAMR AOT section
+python3 tools/append_aot_to_wasm.py filter.wasm filter.aot filter_with_wamr.wasm
+
+# Embed WasmEdge AOT section
+python3 tools/append_aot_to_wasm.py filter_with_wamr.wasm filter_wasmedge_aot.wasm filter_both.wasm \
+    --section-name wasmedge-aot
+```
+
+The resulting `filter_both.wasm` works with all runtimes — WAMR uses its
+`"wamr-aot"` section, WasmEdge uses its `"wasmedge-aot"` section, and
+Wasmtime/V8 ignore both and JIT-compile normally.
+</details>
+
+### Runtime AOT/JIT comparison
+
+| Runtime | Execution mode | Precompilation required? |
+|---------|---------------|--------------------------|
+| **Wasmtime** | JIT (Cranelift) | No — native speed at startup |
+| **V8** | JIT (TurboFan) | No — native speed after warmup |
+| **WAMR** | Interpreter (default) or AOT | **Yes** — use `wamrc` + embed `"wamr-aot"` section |
+| **WasmEdge** | Interpreter (default) or AOT | **Yes** — use `wasmedgec` (output is directly usable) |
 
 ---
 

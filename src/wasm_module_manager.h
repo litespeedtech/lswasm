@@ -27,6 +27,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <iostream>
@@ -965,6 +966,14 @@ public:
     /** Check if the scope was successfully initialized. */
     bool valid() const { return ctx_ != nullptr; }
 
+    /**
+     * Warm up the thread-local VM clone for the given module state.
+     * Returns true if the VM was successfully created/cached.
+     */
+    static bool warmupPersistentPlugin(const ModuleState &state) {
+      return getPersistentThreadLocalPlugin(state) != nullptr;
+    }
+
   private:
     static std::shared_ptr<proxy_wasm::PluginHandleBase>
     getPersistentThreadLocalPlugin(const ModuleState &state) {
@@ -1052,6 +1061,27 @@ public:
    * Thread-safe: takes a write lock on modules_mutex_.
    */
   bool unloadModule(const std::string &module_name);
+
+  /**
+   * Warm up thread-local WASM VM clones for all loaded modules on the
+   * calling thread.  This forces the expensive VM clone + signal setup
+   * to happen once up front rather than on the first real request.
+   *
+   * Call this from each worker thread before it enters its accept loop.
+   * Thread-safe: takes a read lock on modules_mutex_.
+   */
+  void warmupThreadLocal() const {
+    std::shared_lock<std::shared_mutex> lock(modules_mutex_);
+    for (const auto &[name, state] : modules_) {
+      if (RequestScope::warmupPersistentPlugin(state)) {
+        LOG_INFO("[WasmModuleManager] Warmed up thread-local VM for module '"
+                 << name << "' on thread " << std::this_thread::get_id());
+      } else {
+        LOG_ERROR("[WasmModuleManager] Failed to warm up thread-local VM for module '"
+                  << name << "'");
+      }
+    }
+  }
 
   /**
    * Get list of loaded module names.

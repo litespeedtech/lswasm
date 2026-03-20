@@ -204,8 +204,44 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
           std::move(wasm_handle), std::move(plugin_base));
     };
 
-    // Build the VM key for the base_wasms registry.
+    // Build the bytecode string for the base_wasms registry.
     std::string bytecode(reinterpret_cast<const char *>(code), code_size);
+
+#if defined(WASM_RUNTIME_WASMEDGE)
+    // WasmEdge AOT support without modifying the third-party proxy-wasm-cpp-host.
+    //
+    // The WasmEdge integration in proxy-wasm-cpp-host doesn't support
+    // precompiled sections (getPrecompiledSectionName() returns ""), so
+    // the allow_precompiled flag has no effect for WasmEdge.  However,
+    // WasmEdge's WasmEdge_LoaderParseFromBuffer() can transparently load
+    // "universal WASM" files (produced by wasmedgec) which contain native
+    // code alongside the standard WASM sections.
+    //
+    // To support this, we check for a "wasmedge-aot" custom section in
+    // the WASM file.  If present, we extract the universal WASM bytes
+    // and use them as the primary bytecode.  WasmEdge will detect the
+    // native code sections and execute natively instead of interpreting.
+    {
+      std::string_view bytecode_view(bytecode);
+      std::string_view aot_section;
+      if (proxy_wasm::BytecodeUtil::getCustomSection(
+              bytecode_view, "wasmedge-aot", aot_section) &&
+          !aot_section.empty()) {
+        // The custom section payload uses the same padding-byte prefix
+        // as the WAMR "wamr-aot" section:
+        //   byte 0 = padding_count, then padding_count padding bytes,
+        //   followed by the actual AOT data (universal WASM binary).
+        auto padding_count = static_cast<uint8_t>(aot_section[0]);
+        if (static_cast<size_t>(padding_count) + 1 < aot_section.size()) {
+          aot_section.remove_prefix(padding_count + 1);
+          LOG_INFO("Found WasmEdge AOT universal WASM in custom section ("
+                   << aot_section.size() << " bytes); using AOT bytecode");
+          bytecode.assign(aot_section.data(), aot_section.size());
+        }
+      }
+    }
+#endif
+
     std::string vm_key = proxy_wasm::makeVmKey(
         /*vm_id=*/module_name, /*configuration=*/"", bytecode);
 
@@ -214,7 +250,7 @@ bool WasmModuleManager::loadModuleFromMemory(const uint8_t *code, size_t code_si
     LOG_INFO("Creating base WASM handle via createWasm()...");
     auto base_handle = proxy_wasm::createWasm(
         vm_key, bytecode, plugin, wasm_handle_factory, clone_factory,
-        /*allow_precompiled=*/false);
+        /*allow_precompiled=*/true);
     if (!base_handle) {
       LOG_ERROR("Failed to create base WASM handle for module: " << module_name);
       return false;

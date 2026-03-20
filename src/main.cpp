@@ -24,6 +24,7 @@
 #include <map>
 #include <unordered_map>
 #include <atomic>
+#include <thread>
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
@@ -39,6 +40,7 @@
 #include <arpa/inet.h>
 #include <csignal>
 #include <cerrno>
+#include <pthread.h>
 
 #if defined(WASM_RUNTIME_V8)
 #include "v8-initialization.h"
@@ -75,6 +77,10 @@ static std::atomic<bool> g_shutdown{false};
 static int g_server_socket = -1;  // For shutdown coordination to unblock accept()/read().
 constexpr size_t MAX_TRACKED_LSAPI_FDS = 4096;
 static int g_tracked_lsapi_fds[MAX_TRACKED_LSAPI_FDS] = {};
+// Worker thread handles for shutdown: pthread_kill(SIGUSR2) interrupts accept().
+constexpr size_t MAX_WORKER_THREADS = 256;
+static pthread_t g_worker_threads[MAX_WORKER_THREADS] = {};
+static std::atomic<size_t> g_num_worker_threads{0};
 static std::string g_uds_path;    // For cleanup on shutdown
 static std::atomic<uint32_t> g_next_context_id{1};
 static bool g_body_pacifier = false;  // When true, include diagnostic body in responses.
@@ -1045,6 +1051,10 @@ private:
     int server_socket_;
 };
 
+// No-op handler for SIGUSR2: the sole purpose is to interrupt blocking
+// syscalls (accept, read) with EINTR in worker threads during shutdown.
+void sigusr2_handler(int) {}
+
 // Signal handler: keep shutdown work minimal and async-signal-safe while
 // forcing blocking LSAPI/HTTP syscalls to return promptly.
 void signal_handler(int sig) {
@@ -1057,6 +1067,12 @@ void signal_handler(int sig) {
         if (server_socket >= 0) {
             shutdown(server_socket, SHUT_RDWR);
             close(server_socket);
+        }
+        // Interrupt all worker threads blocked in accept()/read() so they
+        // can observe g_shutdown and exit their loops.
+        const size_t n = g_num_worker_threads.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < n; ++i) {
+            pthread_kill(g_worker_threads[i], SIGUSR2);
         }
     }
 }
@@ -1143,9 +1159,14 @@ bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm) {
     return true;
 }
 
-class LsapiRequestOwner {
+/// A reusable LSAPI request object.  Buffers (iovec, response buffer,
+/// response header buffer, request buffer) are allocated once on construction
+/// and persist across requests, avoiding per-request malloc/free overhead.
+/// Between requests only lightweight pointer resets are performed via
+/// LSAPI_Reset_r().
+class LsapiReusableRequest {
 public:
-    explicit LsapiRequestOwner(int listen_fd) {
+    explicit LsapiReusableRequest(int listen_fd) {
         tracked_fd_slot_ = reserve_tracked_lsapi_fd_slot();
         if (LSAPI_InitRequest(&req_, listen_fd) != 0) {
             clear_tracked_lsapi_fd(tracked_fd_slot_);
@@ -1154,10 +1175,10 @@ public:
         initialized_ = true;
     }
 
-    ~LsapiRequestOwner() { cleanup(); }
+    ~LsapiReusableRequest() { destroy(); }
 
-    LsapiRequestOwner(const LsapiRequestOwner &) = delete;
-    LsapiRequestOwner &operator=(const LsapiRequestOwner &) = delete;
+    LsapiReusableRequest(const LsapiReusableRequest &) = delete;
+    LsapiReusableRequest &operator=(const LsapiReusableRequest &) = delete;
 
     LSAPI_Request *request() { return &req_; }
 
@@ -1166,6 +1187,9 @@ public:
         publish_tracked_lsapi_fd(tracked_fd_slot_, req_.m_fd);
     }
 
+    /// End the current response and close the connection, but keep all
+    /// allocated buffers for reuse.  After this call the object is ready
+    /// for another LSAPI_Accept_r() cycle.
     void finishRequest() {
         if (!initialized_ || !request_active_) {
             return;
@@ -1173,10 +1197,26 @@ public:
         clear_tracked_lsapi_fd(tracked_fd_slot_);
         LSAPI_End_Response_r(&req_);
         request_active_ = false;
+        // Reset lightweight state pointers; buffers are preserved.
+        LSAPI_Reset_r(&req_);
+    }
+
+    /// Finish the current response but keep the connection alive for
+    /// potential reuse (HTTP keep-alive).  After this call the fd remains
+    /// open; the next LSAPI_Accept_r() will attempt to read a new request
+    /// on the same connection before falling back to accept().
+    void keepAliveFinish() {
+        if (!initialized_ || !request_active_) {
+            return;
+        }
+        clear_tracked_lsapi_fd(tracked_fd_slot_);
+        LSAPI_Finish_r(&req_);
+        request_active_ = false;
     }
 
 private:
-    void cleanup() {
+    /// Full teardown — frees all buffers.  Only called from destructor.
+    void destroy() {
         clear_tracked_lsapi_fd(tracked_fd_slot_);
         if (!initialized_) {
             return;
@@ -1205,6 +1245,59 @@ private:
     int tracked_fd_slot_ = -1;
     bool initialized_ = false;
     bool request_active_ = false;
+};
+
+/// A fixed-size pool of reusable LsapiReusableRequest objects.  The accept
+/// thread takes a request from the pool before calling LSAPI_Accept_r();
+/// the worker thread returns it after finishing the response.  This avoids
+/// per-request malloc/free of LSAPI buffers and eliminates redundant signal
+/// setup.
+class LsapiRequestPool {
+public:
+    /// Create \p pool_size reusable request objects, each bound to \p listen_fd.
+    LsapiRequestPool(int listen_fd, size_t pool_size) {
+        pool_.reserve(pool_size);
+        for (size_t i = 0; i < pool_size; ++i) {
+            pool_.push_back(std::make_unique<LsapiReusableRequest>(listen_fd));
+            available_.push(pool_.back().get());
+        }
+    }
+
+    /// Take a request from the pool, blocking until one is available.
+    /// Returns nullptr if the pool has been shut down.
+    LsapiReusableRequest *acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return !available_.empty() || stopped_; });
+        if (stopped_ && available_.empty()) return nullptr;
+        auto *req = available_.front();
+        available_.pop();
+        return req;
+    }
+
+    /// Return a request to the pool for reuse.
+    void release(LsapiReusableRequest *req) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            available_.push(req);
+        }
+        cv_.notify_one();
+    }
+
+    /// Wake up any threads blocked in acquire().
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::vector<std::unique_ptr<LsapiReusableRequest>> pool_;
+    std::queue<LsapiReusableRequest *> available_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stopped_ = false;
 };
 
 // LSAPI_ForeachHeader_r callback: accumulate headers into HeaderPairs.
@@ -1490,41 +1583,110 @@ int run_lsapi_loop(const std::string &wasm_module_path,
     try {
         LOG_INFO("[LSAPI] Entering accept loop...");
         if (listen_fd >= 0) {
-            ThreadPool pool(num_workers);
-            LOG_INFO("[LSAPI] Listener mode detected; thread pool started with "
-                     << pool.size() << " workers");
+            // ── Worker-owned accept loops with keep-alive ──
+            //
+            // Each worker thread owns one LSAPI_Request and runs its own
+            // accept loop.  After processing a request, the worker calls
+            // LSAPI_Finish_r() (keep-alive finish) instead of
+            // LSAPI_End_Response_r() (close).  When the web server sends
+            // another request on the same connection, the next
+            // LSAPI_Accept_r() reads it directly without a new accept()
+            // syscall — eliminating per-request accept/close overhead.
+            //
+            // WASM VM warmup: each worker thread calls warmupThreadLocal()
+            // before entering the accept loop, forcing the expensive
+            // thread-local VM clone + signal setup to happen once at
+            // startup rather than on the first real request.
 
-            while (!g_shutdown.load(std::memory_order_relaxed)) {
-                auto req = std::make_shared<LsapiRequestOwner>(listen_fd);
-                if (LSAPI_Accept_r(req->request()) < 0) {
-                    int err = errno;
-                    if (!g_shutdown.load(std::memory_order_relaxed)) {
-                        LOG_ERROR("[LSAPI] LSAPI_Accept_r() failed: " << strerror(err));
-                    }
-                    break;
-                }
-                if (g_shutdown.load(std::memory_order_relaxed) || !LSAPI_IsRunning() ||
-                    req->request()->m_fd == -1) {
-                    break;
-                }
+            // Default to hardware_concurrency if num_workers is 0.
+            size_t actual_workers = num_workers;
+            if (actual_workers == 0) {
+                actual_workers = std::thread::hardware_concurrency();
+                if (actual_workers == 0) actual_workers = 4;
+            }
 
-                req->markAccepted();
-                pool.submit([req]() {
-                    try {
-                        lsapi_handle_request(req->request());
-                    } catch (const std::exception &e) {
-                        LOG_ERROR("[LSAPI] Request processing threw exception: " << e.what());
-                    } catch (...) {
-                        LOG_ERROR("[LSAPI] Request processing threw unknown exception");
+            std::vector<std::unique_ptr<LsapiReusableRequest>> workers;
+            std::vector<std::thread> threads;
+            workers.reserve(actual_workers);
+            threads.reserve(actual_workers);
+
+            for (size_t i = 0; i < actual_workers; ++i) {
+                workers.push_back(std::make_unique<LsapiReusableRequest>(listen_fd));
+            }
+
+            LOG_INFO("[LSAPI] Listener mode: launching " << actual_workers
+                     << " worker threads with keep-alive accept loops");
+
+            for (size_t i = 0; i < actual_workers; ++i) {
+                LsapiReusableRequest *req = workers[i].get();
+                threads.emplace_back([req, i]() {
+                    // Register this thread so the signal handler can
+                    // pthread_kill(SIGUSR2) to unblock accept()/read().
+                    if (i < MAX_WORKER_THREADS) {
+                        g_worker_threads[i] = pthread_self();
+                        g_num_worker_threads.store(
+                            std::max(g_num_worker_threads.load(std::memory_order_relaxed), i + 1),
+                            std::memory_order_release);
                     }
-                    req->finishRequest();
+
+                    // Warm up the WASM VM on this thread before accepting
+                    // any requests, so the expensive VM clone + signal
+                    // setup happens now rather than on the first request.
+                    if (g_module_manager) {
+                        LOG_INFO("[LSAPI] Worker " << i << " warming up WASM VM...");
+                        g_module_manager->warmupThreadLocal();
+                        LOG_INFO("[LSAPI] Worker " << i << " WASM VM warm-up complete");
+                    }
+
+                    // Per-worker accept loop with keep-alive.
+                    while (!g_shutdown.load(std::memory_order_relaxed)) {
+                        if (LSAPI_Accept_r(req->request()) < 0) {
+                            if (!g_shutdown.load(std::memory_order_relaxed)) {
+                                LOG_ERROR("[LSAPI] Worker " << i
+                                          << " LSAPI_Accept_r() failed: "
+                                          << strerror(errno));
+                            }
+                            break;
+                        }
+                        if (g_shutdown.load(std::memory_order_relaxed) ||
+                            !LSAPI_IsRunning() || req->request()->m_fd == -1) {
+                            break;
+                        }
+
+                        req->markAccepted();
+                        try {
+                            lsapi_handle_request(req->request());
+                        } catch (const std::exception &e) {
+                            LOG_ERROR("[LSAPI] Worker " << i
+                                      << " exception: " << e.what());
+                        } catch (...) {
+                            LOG_ERROR("[LSAPI] Worker " << i
+                                      << " unknown exception");
+                        }
+                        // Keep-alive finish: sends RESP_END but keeps the
+                        // connection fd open for the next request.
+                        req->keepAliveFinish();
+                    }
+                    LOG_INFO("[LSAPI] Worker " << i << " exiting accept loop");
                 });
             }
 
-            LOG_INFO("[LSAPI] Draining thread pool...");
-            pool.shutdown();
+            // Wait for all workers to exit.
+            for (auto &t : threads) {
+                if (t.joinable()) t.join();
+            }
+            LOG_INFO("[LSAPI] All worker threads joined");
         } else {
+            // ── Connected-channel mode (single fd from web server) ──
+            // Use keep-alive finish here too so the web server can send
+            // multiple requests on the same connection.
             LOG_INFO("[LSAPI] Connected-channel mode detected; processing requests serially");
+
+            // Warm up the WASM VM on the main thread.
+            if (g_module_manager) {
+                g_module_manager->warmupThreadLocal();
+            }
+
             while (!g_shutdown.load(std::memory_order_relaxed)) {
                 if (LSAPI_Accept_r(&g_req) < 0) {
                     if (!g_shutdown.load(std::memory_order_relaxed)) {
@@ -1544,7 +1706,10 @@ int run_lsapi_loop(const std::string &wasm_module_path,
                 } catch (...) {
                     LOG_ERROR("[LSAPI] Request processing threw unknown exception");
                 }
-                LSAPI_End_Response_r(&g_req);
+                // LSAPI_Finish_r keeps the connection alive for the next
+                // request.  LSAPI_Accept_r will call it again at the top
+                // of the loop (idempotent if already finished).
+                LSAPI_Finish_r(&g_req);
             }
         }
     } catch (const std::exception &e) {
@@ -1693,6 +1858,15 @@ int main(int argc, char *argv[]) {
     LOG_INFO("  • proxy-wasm-cpp-sdk");
     LOG_INFO("  • proxy-wasm-spec");
     LOG_INFO("==============================\n");
+
+    // SIGUSR2: no-op handler used to interrupt worker threads during shutdown.
+    {
+        struct sigaction sa2 {};
+        sa2.sa_handler = sigusr2_handler;
+        sigemptyset(&sa2.sa_mask);
+        sa2.sa_flags = 0;  // No SA_RESTART – we need EINTR.
+        sigaction(SIGUSR2, &sa2, nullptr);
+    }
 
     struct sigaction sa {};
     sa.sa_handler = signal_handler;
