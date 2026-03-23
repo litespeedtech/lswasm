@@ -85,7 +85,8 @@ lswasm/
 │   │   └── lswasm_streaming.h      # SDK-side convenience header for streaming API
 │   ├── sample_filter/              # Basic WASM filter example
 │   ├── send_recv_all/              # Buffered send/receive sample
-│   └── send_recv_stream/           # Streaming response sample
+│   ├── send_recv_stream/           # Streaming echo sample
+│   └── send_stream_size/           # Streaming size-based response generator
 │
 ├── cmake/
 │   └── wasm32-wasi-toolchain.cmake # Toolchain file for building WASM modules
@@ -642,6 +643,7 @@ unsupported hosts return `WasmResult::NotFound`, letting you fall back to
 |--------|-------------|
 | [`samples/send_recv_stream/`](samples/send_recv_stream/) | Streaming echo filter — writes each request body chunk back as it arrives |
 | [`samples/send_recv_all/`](samples/send_recv_all/) | Buffered filter — accumulates the body and responds with `sendLocalResponse()` |
+| [`samples/send_stream_size/`](samples/send_stream_size/) | Streaming size generator — returns a caller-specified number of bytes for download and throughput benchmarking |
 
 See each sample's `README.md` for build and usage instructions.
 
