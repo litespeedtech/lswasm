@@ -83,6 +83,7 @@ lswasm/
 ├── samples/
 │   ├── include/
 │   │   └── lswasm_streaming.h      # SDK-side convenience header for streaming API
+│   ├── lsapi_raw/                  # Native LSAPI prefork benchmark baseline
 │   ├── sample_filter/              # Basic WASM filter example
 │   ├── send_recv_all/              # Buffered send/receive sample
 │   ├── send_recv_stream/           # Streaming echo sample
@@ -556,7 +557,7 @@ Navigate to **Web Admin → Configuration → External App → Add**:
 - **Retry Timeout** = `0`.
 - **Connection Keepalive Timeout** = `60`.
 - **Start By Server** = `Yes (Through CGI Daemon)`
-- **Command** = For OLS: `$SERVER_ROOT/fcgi-bin/lswasm --module $SERVER_ROOT/fcgi-bin/sample_filter.wasm`.
+- **Command** = `$SERVER_ROOT/fcgi-bin/lswasm --module $SERVER_ROOT/fcgi-bin/sample_filter.wasm` 
 - **Instances** = `1`.
 - **Run On Startup** = `Yes (Detached Mode)`.
 
@@ -641,6 +642,7 @@ unsupported hosts return `WasmResult::NotFound`, letting you fall back to
 
 | Sample | Description |
 |--------|-------------|
+| [`samples/lsapi_raw/`](samples/lsapi_raw/) | Native LSAPI prefork baseline — mirrors the size-generator and streaming-echo workloads without a WASM runtime |
 | [`samples/send_recv_stream/`](samples/send_recv_stream/) | Streaming echo filter — writes each request body chunk back as it arrives |
 | [`samples/send_recv_all/`](samples/send_recv_all/) | Buffered filter — accumulates the body and responds with `sendLocalResponse()` |
 | [`samples/send_stream_size/`](samples/send_stream_size/) | Streaming size generator — returns a caller-specified number of bytes for download and throughput benchmarking |
