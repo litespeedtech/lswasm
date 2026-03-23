@@ -849,13 +849,27 @@ private:
 
         // Request-phase streaming responses must be fully finished before the
         // host treats them as a terminal success path.
+        LOG_INFO("[HTTP] Request-phase streaming check: owner='"
+                 << (filter_ctx.streamingOwner().empty() ? std::string("<none>")
+                                                        : filter_ctx.streamingOwner())
+                 << "' has_streaming=" << filter_ctx.hasStreamingResponse()
+                 << " finished=" << filter_ctx.isStreamingFinished()
+                 << " error=" << filter_ctx.hasStreamingError());
+        if (filter_ctx.hasStreamingError()) {
+            LOG_ERROR("[HTTP] Conflicting streaming owners detected");
+            conn->setError();
+            return;
+        }
         if (filter_ctx.hasStreamingResponse()) {
             if (!filter_ctx.isStreamingFinished()) {
-                LOG_ERROR("[HTTP] Streaming response started but was not finished");
+                LOG_ERROR("[HTTP] Streaming response started by module '"
+                          << filter_ctx.streamingOwner()
+                          << "' but was not finished");
                 conn->setError();
                 return;
             }
-            LOG_INFO("[HTTP] Streaming response handled by WASM filter.");
+            LOG_INFO("[HTTP] Streaming response handled by WASM filter module '"
+                     << filter_ctx.streamingOwner() << "'.");
             filter_ctx.onDone();
             conn->finish();
             return;
@@ -881,7 +895,8 @@ private:
 
         if (http_data.has_local_response) {
             if (filter_ctx.hasStreamingResponse()) {
-                LOG_ERROR("[HTTP] Local response requested after streaming response started");
+                LOG_ERROR("[HTTP] Local response requested after streaming response started"
+                          << " by module '" << filter_ctx.streamingOwner() << "'");
                 conn->setError();
                 return;
             }
@@ -892,13 +907,27 @@ private:
             return;
         }
 
+        LOG_INFO("[HTTP] Response-phase streaming check: owner='"
+                 << (filter_ctx.streamingOwner().empty() ? std::string("<none>")
+                                                        : filter_ctx.streamingOwner())
+                 << "' has_streaming=" << filter_ctx.hasStreamingResponse()
+                 << " finished=" << filter_ctx.isStreamingFinished()
+                 << " error=" << filter_ctx.hasStreamingError());
+        if (filter_ctx.hasStreamingError()) {
+            LOG_ERROR("[HTTP] Conflicting streaming owners detected");
+            conn->setError();
+            return;
+        }
         if (filter_ctx.hasStreamingResponse()) {
             if (!filter_ctx.isStreamingFinished()) {
-                LOG_ERROR("[HTTP] Streaming response started but was not finished");
+                LOG_ERROR("[HTTP] Streaming response started by module '"
+                          << filter_ctx.streamingOwner()
+                          << "' but was not finished");
                 conn->setError();
                 return;
             }
-            LOG_INFO("[HTTP] Streaming response handled by WASM filter.");
+            LOG_INFO("[HTTP] Streaming response handled by WASM filter module '"
+                     << filter_ctx.streamingOwner() << "'.");
             filter_ctx.onDone();
             conn->finish();
             return;
@@ -1442,12 +1471,25 @@ void lsapi_handle_request(LSAPI_Request *req) {
     }
 
     // Request-phase streaming responses.
+    LOG_INFO("[LSAPI] Request-phase streaming check: owner='"
+             << (filter_ctx.streamingOwner().empty() ? std::string("<none>")
+                                                    : filter_ctx.streamingOwner())
+             << "' has_streaming=" << filter_ctx.hasStreamingResponse()
+             << " finished=" << filter_ctx.isStreamingFinished()
+             << " error=" << filter_ctx.hasStreamingError());
+    if (filter_ctx.hasStreamingError()) {
+        LOG_ERROR("[LSAPI] Conflicting streaming owners detected");
+        return;
+    }
     if (filter_ctx.hasStreamingResponse()) {
         if (!filter_ctx.isStreamingFinished()) {
-            LOG_ERROR("[LSAPI] Streaming response started but was not finished");
+            LOG_ERROR("[LSAPI] Streaming response started by module '"
+                      << filter_ctx.streamingOwner()
+                      << "' but was not finished");
             return;
         }
-        LOG_INFO("[LSAPI] Streaming response handled by WASM filter.");
+        LOG_INFO("[LSAPI] Streaming response handled by WASM filter module '"
+                 << filter_ctx.streamingOwner() << "'.");
         filter_ctx.onDone();
         return;
     }
@@ -1472,7 +1514,8 @@ void lsapi_handle_request(LSAPI_Request *req) {
 
     if (http_data.has_local_response) {
         if (filter_ctx.hasStreamingResponse()) {
-            LOG_ERROR("[LSAPI] Local response after streaming started");
+            LOG_ERROR("[LSAPI] Local response after streaming started by module '"
+                      << filter_ctx.streamingOwner() << "'");
             return;
         }
         filter_ctx.onDone();
@@ -1484,12 +1527,25 @@ void lsapi_handle_request(LSAPI_Request *req) {
         return;
     }
 
+    LOG_INFO("[LSAPI] Response-phase streaming check: owner='"
+             << (filter_ctx.streamingOwner().empty() ? std::string("<none>")
+                                                    : filter_ctx.streamingOwner())
+             << "' has_streaming=" << filter_ctx.hasStreamingResponse()
+             << " finished=" << filter_ctx.isStreamingFinished()
+             << " error=" << filter_ctx.hasStreamingError());
+    if (filter_ctx.hasStreamingError()) {
+        LOG_ERROR("[LSAPI] Conflicting streaming owners detected");
+        return;
+    }
     if (filter_ctx.hasStreamingResponse()) {
         if (!filter_ctx.isStreamingFinished()) {
-            LOG_ERROR("[LSAPI] Streaming response started but was not finished");
+            LOG_ERROR("[LSAPI] Streaming response started by module '"
+                      << filter_ctx.streamingOwner()
+                      << "' but was not finished");
             return;
         }
-        LOG_INFO("[LSAPI] Streaming response handled by WASM filter.");
+        LOG_INFO("[LSAPI] Streaming response handled by WASM filter module '"
+                 << filter_ctx.streamingOwner() << "'.");
         filter_ctx.onDone();
         return;
     }

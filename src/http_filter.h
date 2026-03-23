@@ -72,25 +72,22 @@ public:
   /// foreign-function handlers can write through the transport-abstract sink.
   void setResponseSink(ResponseSink *sink) { sink_ = sink; }
 
-  /// True if any WASM context in the filter chain started a streaming
-  /// response (i.e. called lswasm_send_response_headers).
-  bool hasStreamingResponse() const {
-    for (const auto &[name, scope] : scopes_) {
-      if (scope.context() && scope.context()->hasStreamingResponse())
-        return true;
-    }
-    return false;
+  /// True once a single request-level streaming owner has been established.
+  bool hasStreamingResponse() const { return !streaming_owner_.empty(); }
+
+  /// True if the streaming owner has finished its response.
+  bool isStreamingFinished() const {
+    if (streaming_owner_.empty()) return false;
+    auto it = scopes_.find(streaming_owner_);
+    return it != scopes_.end() && it->second.context() &&
+           it->second.context()->isStreamingFinished();
   }
 
-  /// True if the streaming response has been finished (lswasm_finish_response
-  /// was called).
-  bool isStreamingFinished() const {
-    for (const auto &[name, scope] : scopes_) {
-      if (scope.context() && scope.context()->isStreamingFinished())
-        return true;
-    }
-    return false;
-  }
+  /// True if multiple modules attempted to own streaming for one request.
+  bool hasStreamingError() const { return streaming_error_; }
+
+  /// Request-level streaming owner module name, or empty if none.
+  const std::string &streamingOwner() const { return streaming_owner_; }
 
   // note: global module manager is declared externally (see below)
 
@@ -148,12 +145,15 @@ public:
             proxy_wasm::WasmHeaderMapType::RequestHeaders);
         // Check if the WASM module sent a local response.
         checkLocalResponse(scope, m);
+        observeStreamingState(scope, m, "onRequestHeaders");
 
         // Store the scope for reuse in later phases.
         module_order_.push_back(m);
         scopes_.emplace(m, std::move(scope));
 
-        if (http_data_->has_local_response) break;  // Stop filter chain
+        if (http_data_->has_local_response || streaming_error_ ||
+            !streaming_owner_.empty())
+          break;  // Stop filter chain once a terminal response path is chosen.
       }
     }
   }
@@ -163,7 +163,13 @@ public:
              << ", body_size=" << http_data_->request_body.size()
              << ", eos=" << end_of_stream << ")");
     for (const std::string &m : module_order_) {
-      if (http_data_->has_local_response) break;
+      if (http_data_->has_local_response || streaming_error_) break;
+      if (!streaming_owner_.empty() && m != streaming_owner_) {
+        LOG_INFO("[Filter] Skipping module '" << m
+                 << "' in onRequestBody; streaming owner is '"
+                 << streaming_owner_ << "'");
+        continue;
+      }
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
       auto *ctx = it->second.context();
@@ -174,6 +180,7 @@ public:
       ctx->setEndOfStream(end_of_stream);
       ctx->onRequestBody(http_data_->request_body.size(), end_of_stream);
       checkLocalResponse(it->second, m);
+      observeStreamingState(it->second, m, "onRequestBody");
     }
   }
 
@@ -192,7 +199,13 @@ public:
     LOG_INFO("[Filter] onResponseHeaders called (context_id: " << context_id_ << ")");
     const bool end_of_stream = http_data_->response_body.empty();
     for (const std::string &m : module_order_) {
-      if (http_data_->has_local_response) break;
+      if (http_data_->has_local_response || streaming_error_) break;
+      if (!streaming_owner_.empty() && m != streaming_owner_) {
+        LOG_INFO("[Filter] Skipping module '" << m
+                 << "' in onResponseHeaders; streaming owner is '"
+                 << streaming_owner_ << "'");
+        continue;
+      }
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
       auto *ctx = it->second.context();
@@ -202,13 +215,20 @@ public:
       http_data_->response_headers = ctx->getHeaderMapOwned(
           proxy_wasm::WasmHeaderMapType::ResponseHeaders);
       checkLocalResponse(it->second, m);
+      observeStreamingState(it->second, m, "onResponseHeaders");
     }
   }
 
   void onResponseBody() {
     LOG_INFO("[Filter] onResponseBody called (context_id: " << context_id_ << ")");
     for (const std::string &m : module_order_) {
-      if (http_data_->has_local_response) break;
+      if (http_data_->has_local_response || streaming_error_) break;
+      if (!streaming_owner_.empty() && m != streaming_owner_) {
+        LOG_INFO("[Filter] Skipping module '" << m
+                 << "' in onResponseBody; streaming owner is '"
+                 << streaming_owner_ << "'");
+        continue;
+      }
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
       auto *ctx = it->second.context();
@@ -220,13 +240,20 @@ public:
       http_data_->response_headers = ctx->getHeaderMapOwned(
           proxy_wasm::WasmHeaderMapType::ResponseHeaders);
       checkLocalResponse(it->second, m);
+      observeStreamingState(it->second, m, "onResponseBody");
     }
   }
 
   void onResponseTrailers() {
     LOG_INFO("[Filter] onResponseTrailers called (context_id: " << context_id_ << ")");
     for (const std::string &m : module_order_) {
-      if (http_data_->has_local_response) break;
+      if (http_data_->has_local_response || streaming_error_) break;
+      if (!streaming_owner_.empty() && m != streaming_owner_) {
+        LOG_INFO("[Filter] Skipping module '" << m
+                 << "' in onResponseTrailers; streaming owner is '"
+                 << streaming_owner_ << "'");
+        continue;
+      }
       auto it = scopes_.find(m);
       if (it == scopes_.end() || !it->second.valid()) continue;
       auto *ctx = it->second.context();
@@ -236,6 +263,7 @@ public:
       http_data_->response_headers = ctx->getHeaderMapOwned(
           proxy_wasm::WasmHeaderMapType::ResponseHeaders);
       checkLocalResponse(it->second, m);
+      observeStreamingState(it->second, m, "onResponseTrailers");
     }
   }
 
@@ -347,9 +375,43 @@ private:
     }
   }
 
+  void observeStreamingState(WasmModuleManager::RequestScope &scope,
+                             const std::string &module_name,
+                             const char *phase) {
+    if (!scope.context()) return;
+
+    const bool started = scope.context()->hasStreamingResponse();
+    const bool finished = scope.context()->isStreamingFinished();
+    LOG_INFO("[Filter] " << phase << ": module='" << module_name
+             << "' streaming_started=" << started
+             << " streaming_finished=" << finished
+             << " owner='"
+             << (streaming_owner_.empty() ? std::string("<none>") : streaming_owner_)
+             << "'");
+
+    if (!started) return;
+    if (streaming_owner_.empty()) {
+      streaming_owner_ = module_name;
+      LOG_INFO("[Filter] Streaming owner set to module '" << streaming_owner_
+               << "' during " << phase);
+      return;
+    }
+    if (streaming_owner_ != module_name) {
+      streaming_error_ = true;
+      LOG_ERROR("[Filter] Module '" << module_name
+                << "' attempted to stream during " << phase
+                << " but owner is already '" << streaming_owner_ << "'");
+    }
+  }
+
   uint32_t context_id_;
   HttpData *http_data_;
   ResponseSink *sink_ = nullptr;  // Injected for streaming response support.
+
+  // Request-level streaming ownership. Only one module may own a streaming
+  // response for the lifetime of a request.
+  std::string streaming_owner_;
+  bool streaming_error_ = false;
 
   // Persistent WASM contexts — created once in onRequestHeaders(), reused
   // across all subsequent phases, destroyed in ~HttpFilterContext().
