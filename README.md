@@ -8,24 +8,24 @@ with support for **Wasmtime**, **V8**, **WasmEdge**, and **WAMR** runtimes.  It 
 
 ---
 
-## Table of Contents
+## Table of contents
 
 - [Features](#features)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
-  - [System Dependencies](#system-dependencies)
-  - [WASM Runtimes](#wasm-runtimes)
+  - [System dependencies](#system-dependencies)
+  - [WASM runtimes](#wasm-runtimes)
 - [Building](#building)
 - [Running](#running)
-  - [Command-Line Reference](#command-line-reference)
-  - [LSAPI Mode (default)](#lsapi-transport-mode)
-  - [Standalone LSPROXY Mode](#standalone-lsproxy-mode)
-- [Installing / Upgrading / Uninstalling](#installing-the-binary)
+  - [Command-line reference](#command-line-reference)
+  - [LSAPI mode (default)](#lsapi-transport-mode)
+  - [Standalone LSPROXY mode](#standalone-lsproxy-mode)
+- [Installing / upgrading / uninstalling](#installing-the-binary)
 - [Configuring LiteSpeed](#configuring-litespeed)
-- [Streaming Response API](#streaming-response-api)
+- [Streaming response API](#streaming-response-api)
 - [Performance](#performance)
-  - [WAMR AOT Precompilation](#wamr-aot-precompilation)
-  - [WasmEdge AOT Precompilation](#wasmedge-aot-precompilation)
+  - [WAMR AOT precompilation](#wamr-aot-precompilation)
+  - [WasmEdge AOT precompilation](#wasmedge-aot-precompilation)
 - [Testing](#testing)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
@@ -104,7 +104,7 @@ lswasm/
 
 ## Prerequisites
 
-### System Dependencies
+### System dependencies
 
 **Ubuntu / Debian:**
 
@@ -126,7 +126,7 @@ sudo dnf install -y cmake git openssl-devel pkg-config cargo
 brew install cmake openssl pkg-config rust
 ```
 
-### WASM Runtimes
+### WASM runtimes
 
 Choose **one** runtime to build against.  The runtime is selected at CMake
 configure time with `-DWASM_RUNTIME=<name>`.
@@ -386,18 +386,18 @@ Runtime found: TRUE
 
 ## Running
 
-### Command-Line Reference
+### Command-line reference
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `--module` | `PATH` | **(required)** Path to the WASM filter module |
-| `--lsapi-addr` | `ADDR` | Bind LSAPI to a specific address (e.g. `127.0.0.1:8000` or `/tmp/lswasm.sock`); LSAPI only |
+| `--module` | `<path>` | **(required)** Path to the WASM filter module |
+| `--lsapi-addr` | `<addr>` | Bind LSAPI to a specific address (e.g. `127.0.0.1:8000` or `/tmp/lswasm.sock`); LSAPI only |
 | `--lsproxy` | — | Switch from default LSAPI mode to standalone LSPROXY mode |
-| `--port` | `PORT` | TCP port for standalone LSPROXY mode (instead of UDS) |
-| `--uds` | `PATH` | Unix domain socket path for LSPROXY mode (default: `/tmp/lswasm.sock`) |
-| `--sock-perm` | `MODE` | UDS file permissions in octal (default: `0666`); LSPROXY only |
-| `--env` | `KEY=VALUE` | Environment variable for WASM modules (repeatable) |
-| `--workers` | `N` | Worker thread count (default: `hardware_concurrency()` or 4) |
+| `--port` | `<port>` | TCP port for standalone LSPROXY mode (instead of UDS) |
+| `--uds` | `<path>` | Unix domain socket path for LSPROXY mode (default: `/tmp/lswasm.sock`) |
+| `--sock-perm` | `<mode>` | UDS file permissions in octal (default: `0666`); LSPROXY only |
+| `--env` | `<key>=<value>` | Environment variable for WASM modules (repeatable) |
+| `--workers` | `<n>` | Worker thread count (default: `hardware_concurrency()` or 4) |
 | `--body-pacifier` | — | Include a diagnostic body in generated responses |
 | `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
 | `--version` | — | Print version and exit |
@@ -431,7 +431,7 @@ Runtime found: TRUE
 ./lswasm --module filter.wasm --env MY_KEY=my_value --env ANOTHER=val
 ```
 
-### LSAPI Transport Mode
+### LSAPI transport mode
 
 LSAPI mode is the **default** and is the recommended communications mode when using a LiteSpeed server.
 
@@ -448,7 +448,7 @@ Unix domain socket path:
 ./lswasm --module filter.wasm --lsapi-addr /tmp/lswasm_lsapi.sock
 ```
 
-### Standalone LSPROXY Mode
+### Standalone LSPROXY mode
 
 Use `--lsproxy` to switch to the standalone UDS/TCP listener.  In this mode
 lswasm exposes its own socket endpoint and can be used as a web-server proxy
@@ -459,7 +459,7 @@ target.
 
 ---
 
-## Installing the Binary
+## Installing the binary
 
 lswasm ships with three lifecycle scripts:
 
@@ -480,8 +480,8 @@ lswasm ships with three lifecycle scripts:
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--bin <path>` | Yes | Path to the compiled lswasm binary |
-| `--install-dir <path>` | Yes | Destination directory for the binary |
+| `--bin` `<path>` | Yes | Path to the compiled `lswasm` binary |
+| `--install-dir` `<path>` | Yes | Destination directory for the binary |
 
 After installing, point LiteSpeed/OpenLiteSpeed at the installed binary.  In the
 common LSAPI deployment model the web server launches lswasm on demand:
@@ -504,8 +504,8 @@ the latest source, rebuilds, and replaces the installed binary.
 
 | Flag | Description |
 |------|-------------|
-| `--build-dir <path>` | Build directory (default: `build`) |
-| `--cmake-args <args>` | Additional CMake configure arguments |
+| `--build-dir` `<path>` | Build directory (default: `build`) |
+| `--cmake-args` `<args>` | Additional CMake configure arguments |
 | `--no-clean` | Incremental build instead of clean rebuild |
 | `--no-pull` | Skip `git pull` (use local source as-is) |
 
@@ -539,13 +539,13 @@ LSAPI target (and add `--lsproxy`).  You will also need to create a service or o
 
 - OpenLiteSpeed or LiteSpeed Enterprise in non-Apache mode.
 - Using the sample filter for testing.
-- Both `lswasm` and the sample filter: `sample_filter.wasm` have been copied to the $SERVER_ROOT/fcgi-bin/ directory, typically `/usr/local/lsws/fcgi-bin`.
+- Both `lswasm` and the sample filter `sample_filter.wasm` have been copied to the `$SERVER_ROOT/fcgi-bin/` directory, typically `/usr/local/lsws/fcgi-bin`.
 
 > Many users will configure the filter for a particular directory (Virtual Host context), often the user's or application's home directory.
 
 ### Steps
 
-Navigate to **Web Admin → Configuration → External App → Add**:
+Navigate to **Web Admin > Configuration > External App > Add**:
 
 - **Type** = `LSAPI App` → press **Next**.
 - **Name** = `wasm` (or any memorable name).
@@ -561,22 +561,31 @@ Navigate to **Web Admin → Configuration → External App → Add**:
 - **Instances** = `1`.
 - **Run On Startup** = `Yes (Detached Mode)`.
 
-Press **Save**, then switch to the **Script Handler** tab:
+Press **Save**, then navigate to **Configuration > Script Handler**:
 
 1. **Suffixes** = `wasm`.
 2. **Handler Type** = `LiteSpeed SAPI`.
 3. **Handler Name** = `wasm` (the name from the External App above).
 
-Press **Save** → perform a **Graceful Restart** to apply.
+Press **Save**, then perform a **Graceful Restart** to apply.
 
-To run a test you will need to create a .wasm file in the default vhost directory.  A simple way to do this would be to use the `touch` command:
-- LiteSpeed Enterprise: `touch /usr/local/lsws/DEFAULT/html`.  Test with curl using: `curl http://127.0.0.1:8088/test.wasm`
-- OpenLiteSpeed: `touch /usr/local/lsws/Example/html`.  Test with curl using: `curl http://127.0.0.1:8088/html/test.wasm`
+To run a test you will need to create a `.wasm` file in the default vhost directory.  A simple way to do this would be to use the `touch` command:
+
+- **LiteSpeed Enterprise:** Create a test file, then verify with curl:
+    ```bash
+    touch /usr/local/lsws/DEFAULT/html/test.wasm
+    curl http://127.0.0.1:8088/test.wasm
+    ```
+- **OpenLiteSpeed:** Create a test file, then verify with curl:
+    ```bash
+    touch /usr/local/lsws/Example/html/test.wasm
+    curl http://127.0.0.1:8088/html/test.wasm
+    ```
 
 
 ---
 
-## Streaming Response API
+## Streaming response API
 
 lswasm extends the proxy-wasm ABI with three **foreign functions** that let a
 WASM filter stream HTTP responses incrementally instead of buffering the entire
@@ -653,7 +662,7 @@ See each sample's `README.md` for build and usage instructions.
 
 ## Performance
 
-### WAMR AOT Precompilation
+### WAMR AOT precompilation
 
 By default, WAMR executes WASM modules in **interpreter mode**, which can be
 significantly slower than native code.  For production deployments,
@@ -742,7 +751,7 @@ python3 tools/append_aot_to_wasm.py filter.wasm filter.aot filter_aot.wasm
 cp filter_aot.wasm /usr/local/lsws/fcgi-bin/filter.wasm
 ```
 
-### WasmEdge AOT Precompilation
+### WasmEdge AOT precompilation
 
 By default, WasmEdge executes WASM modules in **interpreter mode**.  For
 production deployments, `wasmedgec` compiles WASM to native code in a
@@ -876,7 +885,7 @@ Header count: 7
   Accept: */*
 ```
 
-### Raw request with netcat
+### Raw request with `netcat`
 
 ```bash
 echo -e "GET / HTTP/1.1\r\n\r\n" | nc localhost 8080
@@ -915,14 +924,14 @@ Debug logging is activated in either of two ways:
 Logs are written to `/tmp/lswasm.log`.  Start troubleshooting by enabling
 logging and examining this file.
 
-### Verifying lswasm is working
+### Verifying `lswasm` is working
 
 Use the [health checks](#testing) above before relying on the LiteSpeed
 configuration.  If they fail, enable debug logging and check the logs.
 
 ### LiteSpeed output
 
-Check the LiteSpeed error logs.  If running in LiteSpeed mode, these will be error.log and stderr.log in /usr/local/lsws/logs.  If you are running in Apache mode, these are typically in the /var/log/apache2 directory.
+Check the LiteSpeed error logs.  If running in LiteSpeed mode, these will be `error.log` and `stderr.log` in `/usr/local/lsws/logs`.  If you are running in Apache mode, these are typically in the `/var/log/apache2` directory.
 
 ### Runtime not found
 

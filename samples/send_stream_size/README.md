@@ -1,4 +1,4 @@
-# send_stream_size — Streaming Size-Based Response Generator
+# send_stream_size — Streaming size-based response generator
 
 A proxy-wasm sample filter that generates a response of a caller-specified
 size using the **lswasm streaming response API**.
@@ -93,14 +93,14 @@ Example: GET /html/test.wasm?1048576
   → streams 1 MB of random data
 ```
 
-### Throughput benchmarking with wrk
+### Throughput benchmarking with `wrk`
 
 ```bash
 # 10 threads, 100 connections, 30 seconds, requesting 64 KB per response
 wrk -t10 -c100 -d30s http://localhost:8080/bench?65536
 ```
 
-### Comparison with send_recv_stream
+### Comparison with `send_recv_stream`
 
 `send_recv_stream` echoes back the request body — useful for testing
 upload/round-trip scenarios.  `send_stream_size` generates a response of

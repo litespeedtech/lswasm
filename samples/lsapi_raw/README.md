@@ -1,4 +1,4 @@
-# lsapi_raw — Raw LSAPI Prefork Benchmark Baseline
+# lsapi_raw — Raw LSAPI prefork benchmark baseline
 
 A native C++ LSAPI application that provides a **performance baseline**
 for benchmarking lswasm, isolating LSAPI transport overhead from WASM

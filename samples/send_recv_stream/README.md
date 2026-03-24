@@ -1,4 +1,4 @@
-# send_recv_stream — Streaming Echo WASM Filter
+# send_recv_stream — Streaming echo WASM filter
 
 A proxy-wasm sample filter that receives an HTTP request and echoes it back
 using the **lswasm streaming response API** (`lswasm_send_response_headers`,
@@ -78,7 +78,7 @@ dd if=/dev/urandom bs=1M count=10 2>/dev/null | curl -v --data-binary @- http://
 The response should echo back all 10 MB plus the diagnostic preamble,
 streaming incrementally without timeout or buffer-overflow errors.
 
-### Comparison with send_recv_all
+### Comparison with `send_recv_all`
 
 Run the same large POST against `send_recv_all` for contrast — you should
 see it either truncate the response or time out, demonstrating the

@@ -1,4 +1,4 @@
-# Sample Proxy-Wasm Filter
+# Sample proxy-wasm filter
 
 A proxy-wasm filter written in C++ using the
 [proxy-wasm-cpp-sdk](https://github.com/proxy-wasm/proxy-wasm-cpp-sdk)
@@ -62,7 +62,7 @@ WASM module suitable for debugging with Chrome DevTools or `wasm-gdb`:
 ```bash
 cmake -S samples/sample_filter -B samples/sample_filter/build-debug \
   -DCMAKE_TOOLCHAIN_FILE=cmake/wasm32-wasi-toolchain.cmake \
-  -DWASI_SDK_PATH=/path/to/wasi-sdk-29.0 \
+  -DWASI_SDK_PATH=<path/to/wasi-sdk-29.0> \
   -DCMAKE_BUILD_TYPE=Debug
 cmake --build samples/sample_filter/build-debug
 ```
@@ -74,14 +74,14 @@ inline if no toolchain file is provided:
 
 ```bash
 cmake -S samples/sample_filter -B samples/sample_filter/build \
-  -DWASI_SDK_PATH=/path/to/wasi-sdk-29.0
+  -DWASI_SDK_PATH=<path/to/wasi-sdk-29.0>
 cmake --build samples/sample_filter/build
 ```
 
 ### Manual one-liner
 
 ```bash
-WASI_SDK=/path/to/wasi-sdk-29.0
+WASI_SDK=<path/to/wasi-sdk-29.0>
 $WASI_SDK/bin/clang++ --target=wasm32-wasi -O2 -std=c++17 \
   --sysroot=$WASI_SDK/share/wasi-sysroot \
   -fvisibility=hidden -fno-exceptions -fno-rtti \
@@ -109,7 +109,7 @@ $WASI_SDK/bin/clang++ --target=wasm32-wasi -O2 -std=c++17 \
 > needs.  The CMake build exports the full set of proxy-wasm ABI functions;
 > the one-liner above exports only the ones this particular filter implements.
 
-## Usage with lswasm
+## Usage with `lswasm`
 
 ```bash
 ./build/lswasm --module samples/sample_filter/sample_filter.wasm
