@@ -106,21 +106,21 @@ lswasm/
 
 ### System dependencies
 
-**Ubuntu / Debian:**
+#### Ubuntu / Debian
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake git libssl-dev pkg-config cargo
 ```
 
-**Red Hat / AlmaLinux / Rocky Linux:**
+#### Red Hat / AlmaLinux / Rocky Linux
 
 ```bash
 sudo dnf groupinstall -y "Development Tools"
 sudo dnf install -y cmake git openssl-devel pkg-config cargo
 ```
 
-**macOS:**
+#### macOS
 
 ```bash
 brew install cmake openssl pkg-config rust
