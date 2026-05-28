@@ -306,18 +306,28 @@ public:
                                            proxy_wasm::Pairs additional_headers,
                                            proxy_wasm::GrpcStatusCode grpc_status,
                                            std::string_view details) override {
-    local_response_code_ = response_code;
+    local_response_code_ = http_utils::sanitize_status_code(response_code);
     local_response_body_ = std::string(body);
     local_response_details_ = std::string(details);
-    // Convert string_view pairs to owned strings.
+    // Convert string_view pairs to owned strings, dropping any pair whose
+    // key or value contains bytes that would split the response.  A WASM
+    // filter forwarding untrusted input into a header would otherwise be
+    // able to inject arbitrary additional headers.
     local_response_headers_.clear();
+    size_t dropped = 0;
     for (const std::pair<std::string_view, std::string_view> &h : additional_headers) {
+      if (!http_utils::is_valid_header_name_chars(h.first) ||
+          !http_utils::is_valid_header_value_chars(h.second)) {
+        ++dropped;
+        continue;
+      }
       local_response_headers_.emplace_back(std::string(h.first), std::string(h.second));
     }
     has_local_response_ = true;
-    LOG_INFO("[WASM] sendLocalResponse: code=" << response_code
+    LOG_INFO("[WASM] sendLocalResponse: code=" << local_response_code_
              << " body_size=" << body.size()
-             << " additional_headers=" << local_response_headers_.size());
+             << " additional_headers=" << local_response_headers_.size()
+             << (dropped ? " dropped_invalid=" + std::to_string(dropped) : ""));
     return proxy_wasm::WasmResult::Ok;
   }
 
@@ -342,6 +352,15 @@ public:
     HeaderPairs &owned = header_maps_[type];
     owned.clear();
     for (const std::pair<std::string_view, std::string_view> &p : pairs) {
+      // Reject splitting attempts.  Returning BadArgument signals the WASM
+      // module that the request was malformed; per-pair filtering would be
+      // ambiguous since the caller intends to replace the entire map.
+      if (!http_utils::is_valid_header_name_chars(p.first) ||
+          !http_utils::is_valid_header_value_chars(p.second)) {
+        owned.clear();
+        LOG_ERROR("[WASM] setHeaderMapPairs: rejected pair with CR/LF/NUL");
+        return proxy_wasm::WasmResult::BadArgument;
+      }
       owned.emplace_back(std::string(p.first), std::string(p.second));
     }
     return proxy_wasm::WasmResult::Ok;
@@ -367,6 +386,11 @@ public:
   proxy_wasm::WasmResult addHeaderMapValue(proxy_wasm::WasmHeaderMapType type,
                                            std::string_view key,
                                            std::string_view value) override {
+    if (!http_utils::is_valid_header_name_chars(key) ||
+        !http_utils::is_valid_header_value_chars(value)) {
+      LOG_ERROR("[WASM] addHeaderMapValue: rejected key/value with CR/LF/NUL");
+      return proxy_wasm::WasmResult::BadArgument;
+    }
     header_maps_[type].emplace_back(std::string(key), std::string(value));
     return proxy_wasm::WasmResult::Ok;
   }
@@ -374,6 +398,11 @@ public:
   proxy_wasm::WasmResult replaceHeaderMapValue(proxy_wasm::WasmHeaderMapType type,
                                                std::string_view key,
                                                std::string_view value) override {
+    if (!http_utils::is_valid_header_name_chars(key) ||
+        !http_utils::is_valid_header_value_chars(value)) {
+      LOG_ERROR("[WASM] replaceHeaderMapValue: rejected key/value with CR/LF/NUL");
+      return proxy_wasm::WasmResult::BadArgument;
+    }
     HeaderPairs &pairs = header_maps_[type];
     // Remove all existing occurrences of this key (handles multi-value headers).
     pairs.erase(std::remove_if(pairs.begin(), pairs.end(),
@@ -479,12 +508,24 @@ public:
       return proxy_wasm::WasmResult::BadArgument;
     }
 
-    if (!sink_->sendHeaders(status_code, headers, /*streaming=*/true)) {
+    // Validate header pairs at the boundary.  serialize_headers also drops
+    // bad pairs as defense-in-depth, but rejecting here gives the WASM
+    // module a clear BadArgument signal it can react to.
+    for (const auto &[k, v] : headers) {
+      if (!http_utils::is_valid_header_name_chars(k) ||
+          !http_utils::is_valid_header_value_chars(v)) {
+        LOG_ERROR("[Streaming] sendHeaders rejected pair with CR/LF/NUL");
+        return proxy_wasm::WasmResult::BadArgument;
+      }
+    }
+
+    const uint32_t code = http_utils::sanitize_status_code(status_code);
+    if (!sink_->sendHeaders(code, headers, /*streaming=*/true)) {
       LOG_ERROR("[Streaming] sendHeaders failed");
       return proxy_wasm::WasmResult::InternalFailure;
     }
     streaming_state_ = StreamingResponseState::HeadersSent;
-    LOG_INFO("[Streaming] sent headers: status=" << status_code
+    LOG_INFO("[Streaming] sent headers: status=" << code
              << " header_count=" << headers.size());
     return proxy_wasm::WasmResult::Ok;
   }
@@ -922,6 +963,12 @@ public:
       ctx_->onCreate();
       ctx_->resetLocalResponse();
       ctx_->resetHeaderMaps();
+      // Clear any streaming state left over from a previous request on this
+      // reused thread-local context.  Without this, a context whose prior
+      // request left streaming_state_ != Idle would reject the next
+      // request's streamingSendHeaders() with BadArgument and bind a stale
+      // state to a fresh ResponseSink.
+      ctx_->resetStreamingState();
       context_id_ = context_id;
       return true;
     }

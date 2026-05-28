@@ -393,21 +393,56 @@ Runtime found: TRUE
 | `--module` | `<path>` | **(required)** Path to the WASM filter module |
 | `--lsapi-addr` | `<addr>` | Bind LSAPI to a specific address (e.g. `127.0.0.1:8000` or `/tmp/lswasm.sock`); LSAPI only |
 | `--lsproxy` | — | Switch from default LSAPI mode to standalone LSPROXY mode |
-| `--port` | `<port>` | TCP port for standalone LSPROXY mode (instead of UDS) |
+| `--port` | `<port>` | TCP port for standalone LSPROXY mode (instead of UDS); `1..65535` |
+| `--bind` | `<addr>` | TCP bind address for LSPROXY mode (default: `127.0.0.1`; use `0.0.0.0` to listen on all interfaces) |
 | `--uds` | `<path>` | Unix domain socket path for LSPROXY mode (default: `/tmp/lswasm.sock`) |
-| `--sock-perm` | `<mode>` | UDS file permissions in octal (default: `0666`); LSPROXY only |
-| `--env` | `<key>=<value>` | Environment variable for WASM modules (repeatable) |
-| `--workers` | `<n>` | Worker thread count (default: `hardware_concurrency()` or 4) |
+| `--sock-perm` | `<mode>` | Listener UDS file permissions in octal (default: `0600`, owner-only). Applies to LSPROXY `--uds` and to the LSAPI listener created by `--lsapi-addr`. |
+| `--env` | `<key>=<value>` | Environment variable for WASM modules (repeatable). Values may contain secrets; lswasm logs only the keys. |
+| `--workers` | `<n>` | Worker thread count (default: `hardware_concurrency()` or 4; max 256) |
 | `--body-pacifier` | — | Include a diagnostic body in generated responses |
 | `--debug` | — | Enable debug logging to `/tmp/lswasm.log` |
 | `--version` | — | Print version and exit |
 | `--help` | — | Show usage and exit |
 
 > When both `--port` and `--uds` are given, only `--uds` is used.
-> `--port`, `--uds`, and `--sock-perm` all require `--lsproxy`.
+> `--port`, `--bind`, and `--uds` all require `--lsproxy`.
 > `--lsapi-addr` requires LSAPI mode (cannot be combined with `--lsproxy`).
 
 > lswasm needs to be run as a non-root user.
+
+#### Security defaults
+
+lswasm has **no built-in authentication on its listener** — anyone with
+filesystem access to the UDS path or network reachability to the TCP port
+can speak HTTP/LSAPI to it.  The defaults are therefore deliberately
+restrictive; broaden them only when a specific deployment requires it:
+
+| Surface | Default | Broaden with | When |
+|---------|---------|--------------|------|
+| TCP listener | `127.0.0.1` (loopback only) | `--bind 0.0.0.0` | Remote web server / proxy must connect across hosts. Restrict with firewall/ACLs in front of lswasm. |
+| UDS file mode | `0600` (owner only) | `--sock-perm 0660` (with shared group) or `--sock-perm 0666` | Web server (LiteSpeed/OpenLiteSpeed) runs as a different user than lswasm. Prefer `0660` plus a shared group over `0666`. |
+| `--env` values | Not logged | — | Treat `--env` values as secrets; lswasm logs only the key names. |
+| WASM module path | Symlinks at the path are refused | Resolve the symlink yourself and pass the real path | Operator preference. |
+| LSPROXY concurrent connections | Capped at 1024; excess accepts get `503` and are closed | Recompile with a different `MAX_LSPROXY_CONNECTIONS` | Tune for your workload. |
+| LSPROXY idle connections | Closed after 60s of no socket activity | Recompile with a different `LSPROXY_IDLE_TIMEOUT_SECS` | Long-lived idle streams from trusted clients. |
+
+Requests that look like HTTP smuggling attempts are rejected before
+reaching the filter chain: `Transfer-Encoding` other than `identity`,
+duplicate or non-numeric `Content-Length`, request bodies over 1 GiB,
+embedded NUL or CR/LF in headers, obs-fold continuation lines, and
+non-token characters in header names all return `400 Bad Request` /
+`413 Payload Too Large` and close the connection.
+
+Headers produced by WASM filters are also validated before reaching the
+wire.  Header names must be RFC 7230 tokens; values must not contain
+NUL/CR/LF.  Filter APIs (`sendLocalResponse`, streaming headers, header
+add/replace/set) return `BadArgument` on violation; the response
+serializer drops any surviving invalid pairs as a final guard against
+response splitting.  Status codes supplied by filters are clamped to
+the `[100, 599]` range (anything outside becomes `500`).  The same
+RFC 7230 token check is applied to LSAPI request headers, so a
+misbehaving upstream cannot smuggle control bytes into the request
+headers seen by the filter.
 
 ### Basic usage
 
@@ -421,11 +456,14 @@ Runtime found: TRUE
 # Standalone LSPROXY with default UDS:
 ./lswasm --module filter.wasm --lsproxy
 
-# Standalone LSPROXY on TCP port 9000 with 8 workers:
+# Standalone LSPROXY on TCP port 9000 (loopback only) with 8 workers:
 ./lswasm --module filter.wasm --lsproxy --port 9000 --workers 8
 
-# Custom UDS path:
-./lswasm --module filter.wasm --lsproxy --uds /var/run/lswasm.sock
+# Standalone LSPROXY on TCP port 9000, accept from any interface:
+./lswasm --module filter.wasm --lsproxy --port 9000 --bind 0.0.0.0
+
+# Custom UDS path, world-accessible (e.g. LiteSpeed runs as a different user):
+./lswasm --module filter.wasm --lsproxy --uds /var/run/lswasm.sock --sock-perm 0666
 
 # Pass env vars to the WASM module:
 ./lswasm --module filter.wasm --env MY_KEY=my_value --env ANOTHER=val
@@ -454,8 +492,12 @@ Use `--lsproxy` to switch to the standalone UDS/TCP listener.  In this mode
 lswasm exposes its own socket endpoint and can be used as a web-server proxy
 target.
 
-- `--port`, `--uds`, and `--sock-perm` apply only in this mode.
+- `--port`, `--bind`, and `--uds` apply only in this mode.
+- `--sock-perm` applies to UDS listeners in either mode (LSPROXY `--uds`
+  and LSAPI `--lsapi-addr <unix-path>`).
 - When both `--port` and `--uds` are given, only `--uds` is used.
+- TCP listeners default to `127.0.0.1`; UDS files default to mode `0600`.
+  See [Security defaults](#security-defaults) for when and how to broaden.
 
 ---
 
@@ -500,12 +542,25 @@ For standalone mode, run with `--lsproxy` instead.
 
 The upgrade script reads the install state from
 `~/.local/state/lswasm/install-state.env` (written by `install.sh`), pulls
-the latest source, rebuilds, and replaces the installed binary.
+the latest source, rebuilds, and replaces the installed binary.  The state
+directory is kept at mode `0700`; `upgrade.sh` refuses to source the state
+file if it is a symlink or owned by another user.
+
+> **Trust on `git pull`.**  By default `upgrade.sh` builds and installs
+> whatever code is at the remote `HEAD`.  For production upgrades, prefer
+> pinning to a signed tag and running with `--no-pull`:
+>
+> ```bash
+> git fetch --tags
+> git verify-tag v1.2.3
+> git checkout v1.2.3
+> ./upgrade.sh --no-pull
+> ```
 
 | Flag | Description |
 |------|-------------|
 | `--build-dir` `<path>` | Build directory (default: `build`) |
-| `--cmake-args` `<args>` | Additional CMake configure arguments |
+| `--cmake-args` `<args>` | Additional CMake configure arguments (split on whitespace; not shell-interpreted) |
 | `--no-clean` | Incremental build instead of clean rebuild |
 | `--no-pull` | Skip `git pull` (use local source as-is) |
 
@@ -568,6 +623,14 @@ Press **Save**, then navigate to **Configuration > Script Handler**:
 3. **Handler Name** = `wasm` (the name from the External App above).
 
 Press **Save**, then perform a **Graceful Restart** to apply.
+
+> **Socket permissions.**  lswasm creates its LSAPI listener socket mode
+> `0600` (owner-only) by default.  If LiteSpeed and lswasm run as the
+> same user (the typical "Start By Server" setup above), no change is
+> needed.  If they run as different users, add `--sock-perm` to the
+> **Command** line — for example
+> `--sock-perm 0660` with a shared group, or `--sock-perm 0666` for an
+> open socket — and ensure the socket directory permits access.
 
 To run a test you will need to create a `.wasm` file in the default vhost directory.  A simple way to do this would be to use the `touch` command:
 
@@ -923,6 +986,12 @@ Debug logging is activated in either of two ways:
 
 Logs are written to `/tmp/lswasm.log`.  Start troubleshooting by enabling
 logging and examining this file.
+
+> **Sensitive data.**  The log file is created mode `0600` (owner-only)
+> with `O_NOFOLLOW` to refuse a pre-existing symlink at the path.  It
+> records request URIs, header values, and internal state — treat it as
+> confidential.  Do not relax the mode here; for a multi-process shared
+> log, arrange it via group ownership or syslog instead.
 
 ### Verifying `lswasm` is working
 

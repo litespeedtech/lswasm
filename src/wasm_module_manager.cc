@@ -21,29 +21,82 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include "include/proxy-wasm/bytecode_util.h"
 
+// Hard cap on WASM module file size.  256 MiB is generous for any realistic
+// proxy-wasm filter and prevents an attacker-controlled path (symlink to
+// /dev/zero, sparse file, or accidentally pointing at a huge artifact) from
+// triggering a several-gigabyte allocation.
+static constexpr size_t kMaxWasmModuleBytes = static_cast<size_t>(256) << 20;
+
 bool WasmModuleManager::loadModule(const std::string &module_path,
                                     const std::string &module_name) {
-  // Read WASM file
-  std::ifstream file(module_path, std::ios::binary | std::ios::ate);
-  if (!file.is_open()) {
-    LOG_ERROR("Failed to open WASM module: " << module_path);
+  // Open with O_NOFOLLOW so a symlink at the final path component is
+  // rejected.  An attacker who can replace the path with a symlink between
+  // CLI parsing and load would otherwise trick lswasm into reading an
+  // unrelated file.  Operators who genuinely need a symlinked install path
+  // should canonicalise before passing --module.
+  int fd = ::open(module_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ELOOP) {
+      LOG_ERROR("Refusing to open WASM module via symlink: " << module_path
+                << " (resolve the symlink and pass the real path to --module).");
+    } else {
+      LOG_ERROR("Failed to open WASM module: " << module_path
+                << ": " << strerror(errno));
+    }
     return false;
   }
 
-  size_t file_size = file.tellg();
-  file.seekg(0, std::ios::beg);
+  // Verify the opened fd is a regular file with a sane size.  Special
+  // files (/dev/zero, fifos, sockets) and absurdly large files are refused
+  // before any large allocation.
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) {
+    LOG_ERROR("fstat() on WASM module failed: " << module_path
+              << ": " << strerror(errno));
+    ::close(fd);
+    return false;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    LOG_ERROR("WASM module path is not a regular file: " << module_path);
+    ::close(fd);
+    return false;
+  }
+  if (st.st_size < 0 || static_cast<uintmax_t>(st.st_size) > kMaxWasmModuleBytes) {
+    LOG_ERROR("WASM module size " << st.st_size << " bytes exceeds limit ("
+              << kMaxWasmModuleBytes << " bytes): " << module_path);
+    ::close(fd);
+    return false;
+  }
 
+  size_t file_size = static_cast<size_t>(st.st_size);
   std::vector<uint8_t> code(file_size);
-  file.read(reinterpret_cast<char *>(code.data()), file_size);
-  file.close();
-
-  if (!file) {
-    LOG_ERROR("Failed to read WASM module: " << module_path);
-    return false;
+  size_t consumed = 0;
+  while (consumed < file_size) {
+    ssize_t n = ::read(fd, code.data() + consumed, file_size - consumed);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      LOG_ERROR("Failed to read WASM module: " << module_path
+                << ": " << strerror(errno));
+      ::close(fd);
+      return false;
+    }
+    if (n == 0) {
+      LOG_ERROR("WASM module shrank during read (expected " << file_size
+                << " bytes, got " << consumed << "): " << module_path);
+      ::close(fd);
+      return false;
+    }
+    consumed += static_cast<size_t>(n);
   }
+  ::close(fd);
 
   return loadModuleFromMemory(code.data(), code.size(), module_name);
 }

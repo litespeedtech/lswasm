@@ -78,13 +78,35 @@ else
 fi
 
 # ── Persist install metadata for upgrade/uninstall ──────────────────────
+# The state file is sourced by upgrade.sh as shell, so it must be writable
+# only by the current user.  We:
+#   1. Lock the state directory to 0700 (owner-only) so a malicious neighbor
+#      cannot plant a symlink at the state-file path.
+#   2. Write to a freshly-created temporary file under a tight umask and
+#      atomically rename it over the final target, so a symlink swap mid-write
+#      cannot redirect the contents to an unrelated file.
 STATE_DIR="${HOME}/.local/state/lswasm"
 STATE_FILE="${STATE_DIR}/install-state.env"
 mkdir -p "$STATE_DIR"
-cat > "$STATE_FILE" <<EOF
-INSTALLED_BIN=${INSTALLED_BIN}
-INSTALL_DIR=${INSTALL_DIR}
-EOF
+chmod 0700 "$STATE_DIR"
+
+# Refuse to operate if the existing state path is a symlink — that would
+# indicate either a tampering attempt or an unusual operator configuration
+# that this script is not designed for.
+if [[ -L "$STATE_FILE" ]]; then
+  echo "Error: $STATE_FILE is a symlink; refusing to overwrite." >&2
+  exit 1
+fi
+
+TMP_STATE_FILE="$(mktemp "${STATE_DIR}/install-state.env.XXXXXX")"
+trap 'rm -f "$TMP_STATE_FILE"' EXIT
+chmod 0600 "$TMP_STATE_FILE"
+{
+  printf 'INSTALLED_BIN=%q\n' "$INSTALLED_BIN"
+  printf 'INSTALL_DIR=%q\n' "$INSTALL_DIR"
+} > "$TMP_STATE_FILE"
+mv -f "$TMP_STATE_FILE" "$STATE_FILE"
+trap - EXIT
 echo "State saved to $STATE_FILE"
 
 echo ""

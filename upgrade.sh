@@ -55,11 +55,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Load install state ──────────────────────────────────────────────────
-STATE_FILE="${HOME}/.local/state/lswasm/install-state.env"
+STATE_DIR="${HOME}/.local/state/lswasm"
+STATE_FILE="${STATE_DIR}/install-state.env"
 if [[ ! -f "$STATE_FILE" ]]; then
   echo "Error: install state not found at $STATE_FILE" >&2
   echo "Has lswasm been installed with install.sh?" >&2
   exit 1
+fi
+
+# Refuse to source the state file unless it is a plain regular file owned by
+# the current user.  install.sh writes it under a 0700 directory; anything
+# else is a tampering signal.
+if [[ -L "$STATE_FILE" ]]; then
+  echo "Error: $STATE_FILE is a symlink; refusing to source." >&2
+  exit 1
+fi
+state_owner="$(stat -c '%u' "$STATE_FILE" 2>/dev/null || stat -f '%u' "$STATE_FILE" 2>/dev/null || echo "")"
+if [[ -z "$state_owner" || "$state_owner" != "$(id -u)" ]]; then
+  echo "Error: $STATE_FILE is not owned by the current user." >&2
+  exit 1
+fi
+state_dir_mode="$(stat -c '%a' "$STATE_DIR" 2>/dev/null || stat -f '%Lp' "$STATE_DIR" 2>/dev/null || echo "")"
+if [[ -n "$state_dir_mode" && "$state_dir_mode" != "700" ]]; then
+  echo "Warning: $STATE_DIR is mode $state_dir_mode (expected 700)." >&2
 fi
 
 # shellcheck source=/dev/null
@@ -76,9 +94,16 @@ echo "Build directory:  $BUILD_DIR"
 echo ""
 
 # ── Step 1: Pull latest source ──────────────────────────────────────────
+# SECURITY NOTE: `git pull` builds and installs whatever code is at the
+# remote HEAD with the privileges of the current user.  For production
+# upgrades, verify the new HEAD before rebuilding — pin to a signed tag
+# (`git fetch && git verify-tag <tag> && git checkout <tag>`) or review the
+# commit range manually (`git log HEAD..@{u} --stat`).  Pass --no-pull and
+# run those steps by hand if you want to gate the upgrade on review.
 if $PULL; then
   echo "→ Pulling latest source..."
   git pull
+  echo "  New HEAD: $(git rev-parse HEAD)"
   echo ""
 fi
 
@@ -97,7 +122,12 @@ fi
 mkdir -p "$BUILD_DIR"
 
 echo "→ Configuring..."
-eval "declare -a CMAKE_ARGS_ARRAY=($CMAKE_ARGS)"
+# Split CMAKE_ARGS into words via `read`.  Older revisions used `eval` on
+# this string, which executed arbitrary shell when the caller supplied
+# command substitutions or `; ...` injections in --cmake-args.
+# read -a handles standard whitespace-separated arguments; quoting inside
+# CMAKE_ARGS is no longer interpreted as shell syntax.
+read -r -a CMAKE_ARGS_ARRAY <<< "$CMAKE_ARGS"
 cmake -B "$BUILD_DIR" "${CMAKE_ARGS_ARRAY[@]}" .
 
 echo "→ Building..."

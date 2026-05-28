@@ -47,8 +47,12 @@ inline std::mutex g_log_mutex;
  * Initialize the logging subsystem.
  * Call once at program start.  Logging is enabled when the sentinel file
  * exists OR when \p debug is true (e.g. via the --debug CLI switch).
- * When creating the log file for the first time the permissions are set
- * to 0666 so that any process can append to it.
+ *
+ * The log file is created mode 0600 (owner-only) and we do not clear the
+ * process umask — request URIs, header values, and internal state get
+ * written here, so any wider access is a confidentiality hazard.
+ * Operators who want a multi-process shared log should arrange for it via
+ * group ownership or syslog, not by relaxing the file mode here.
  */
 inline void log_init(bool debug = false) {
   struct stat st;
@@ -57,13 +61,13 @@ inline void log_init(bool debug = false) {
     enable = true;
   }
   if (enable) {
-    // If the log file does not yet exist, create it with mode 0666.
-    // Temporarily clear the umask so the requested permissions are applied
-    // exactly (the default umask would mask out group/other write bits).
+    // Create the log file if missing.  O_NOFOLLOW prevents a pre-existing
+    // symlink at the path from redirecting writes elsewhere; combined with
+    // mode 0600 this ensures only the running user can read the contents.
     if (stat(LOG_PATH, &st) != 0) {
-      mode_t old_umask = ::umask(0);
-      int fd = ::open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
-      ::umask(old_umask);
+      int fd = ::open(LOG_PATH,
+                      O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW,
+                      0600);
       if (fd >= 0) {
         ::close(fd);
       }

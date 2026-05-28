@@ -23,6 +23,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <cerrno>
 #include <cstring>
 
 #include "log.h"
@@ -284,10 +285,16 @@ private:
 
     void signal_eventfd() {
         uint64_t val = 1;
-        // Best-effort write — if it fails (e.g. would-block), the event
-        // loop will pick up the pending state on the next iteration anyway.
+        // The event loop will pick up the pending state on the next epoll
+        // iteration even if this write is short — EAGAIN on an eventfd just
+        // means the 64-bit counter is saturated, which itself signals there
+        // is already a pending event.  Log any other errno so that a wedged
+        // shutdown does not look silent.
         ssize_t r = ::write(event_fd_, &val, sizeof(val));
-        (void)r;
+        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            LOG_ERROR("[ConnectionIO] eventfd write failed (fd " << event_fd_
+                      << "): " << std::strerror(errno));
+        }
     }
 
     int fd_;

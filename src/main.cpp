@@ -24,6 +24,7 @@
 #include <map>
 #include <unordered_map>
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <stdexcept>
 #include <sstream>
@@ -66,11 +67,30 @@ extern "C" {
 // HTTP Server Configuration
 const int DEFAULT_PORT = 8080;
 const char *DEFAULT_UDS_PATH = "/tmp/lswasm.sock";
+// Default TCP bind address: loopback only.  Non-loopback access is opt-in via
+// --bind so that lswasm is not exposed to the network by accident.
+const char *DEFAULT_BIND_ADDR = "127.0.0.1";
+// Default Unix domain socket permissions: owner-only (0600).  Cross-user
+// access (e.g. when a web server runs as a different user than lswasm)
+// requires an explicit --sock-perm override and/or group setup.
+const mode_t DEFAULT_SOCK_PERM = 0600;
+// Maximum HTTP request body size accepted by the LSPROXY listener (1 GiB).
+// This caps Content-Length to bound a single connection's resource use; it is
+// not a per-process limit.
+const size_t MAX_REQUEST_BODY = static_cast<size_t>(1) << 30;
 const int BACKLOG = 128;
 const int BUFFER_SIZE = 65536;          // 64 KB per recv() syscall
 const int MAX_EPOLL_EVENTS = 64;
 const size_t MAX_HEADER_SIZE = 65536;   // 64 KB limit for request headers
 const size_t BODY_CHUNK_SIZE = 524288;  // 512 KB streaming chunk size
+// Maximum concurrent client connections accepted by the LSPROXY listener.
+// Above this we close incoming connections immediately to bound memory and
+// fd usage under slow-loris or fork-bomb-style load.  Compile-time constant;
+// no CLI knob today because the realistic deployment uses LSAPI mode.
+const size_t MAX_LSPROXY_CONNECTIONS = 1024;
+// Per-connection idle timeout in seconds: a connection that neither sends
+// request bytes nor receives response bytes within this window is closed.
+const int LSPROXY_IDLE_TIMEOUT_SECS = 60;
 
 // Global state
 static std::atomic<bool> g_shutdown{false};
@@ -109,7 +129,7 @@ int reserve_tracked_lsapi_fd_slot();
 void publish_tracked_lsapi_fd(int slot, int fd);
 void clear_tracked_lsapi_fd(int slot);
 void shutdown_tracked_lsapi_fds();
-bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm = 0666);
+bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm = DEFAULT_SOCK_PERM);
 } // anonymous namespace
 
 // ── lswasm_send_response_headers ──
@@ -166,52 +186,163 @@ static proxy_wasm::RegisterForeignFunction register_finish_response(
       return ctx->streamingFinish();
     });
 
-// Extract Content-Length value from raw HTTP header data (case-insensitive).
-// Returns 0 if the header is absent or on parse error.
-static size_t extract_content_length(const std::string &headers) {
-    // Scan for lines beginning with "Content-Length:" (case-insensitive).
+// Parsed result of HTTP framing headers (Content-Length / Transfer-Encoding).
+struct FramingHeaders {
+    enum class Status {
+        Ok,
+        ConflictingContentLength,    // 400: duplicate or contradictory CL values
+        InvalidContentLength,        // 400: non-digit / overflow
+        ContentLengthTooLarge,       // 413: exceeds MAX_REQUEST_BODY
+        TransferEncodingPresent,     // 400: any TE other than identity
+        CLAndTEMixed,                // 400: both CL and TE — smuggling vector
+    };
+    Status status = Status::Ok;
+    size_t content_length = 0;
+};
+
+// RFC 7230 §3.2.6 — token characters are the only valid header-name bytes.
+static bool is_tchar(unsigned char c) {
+    if (c >= 'a' && c <= 'z') return true;
+    if (c >= 'A' && c <= 'Z') return true;
+    if (c >= '0' && c <= '9') return true;
+    switch (c) {
+    case '!': case '#': case '$': case '%': case '&': case '\'':
+    case '*': case '+': case '-': case '.': case '^': case '_':
+    case '`': case '|': case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Header-name character predicate for full header validation.
+static bool is_valid_header_name(std::string_view name) {
+    if (name.empty()) return false;
+    for (unsigned char c : name) {
+        if (!is_tchar(c)) return false;
+    }
+    return true;
+}
+
+// Header-value character predicate.  RFC 7230 §3.2.6 allows VCHAR, SP, HTAB
+// and obs-text; we reject CR/LF/NUL outright (the rest of CTL is permitted by
+// obs-text but harmless to forward).
+static bool is_valid_header_value(std::string_view value) {
+    for (unsigned char c : value) {
+        if (c == '\0' || c == '\r' || c == '\n') return false;
+    }
+    return true;
+}
+
+// Parse Content-Length and Transfer-Encoding from the raw header block.
+// Walks every "CR? LF"-terminated line, identifying duplicate / mismatched
+// Content-Length values and any Transfer-Encoding presence so the caller can
+// reject smuggling-prone requests.
+static FramingHeaders parse_framing_headers(const std::string &headers) {
+    FramingHeaders out;
+    bool saw_cl = false;
+    bool saw_te = false;
+
     size_t pos = 0;
+    // Skip the request line.
+    {
+        size_t line_end = headers.find('\n', pos);
+        if (line_end == std::string::npos) return out;
+        pos = line_end + 1;
+    }
+
     while (pos < headers.size()) {
-        // Find start of the next line.
         size_t line_end = headers.find('\n', pos);
         if (line_end == std::string::npos) line_end = headers.size();
         std::string_view line(headers.data() + pos, line_end - pos);
-        // Strip trailing \r
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        pos = line_end + 1;
+        if (line.empty()) break;  // end of header block
 
-        if (line.size() > 15 && line[14] == ':') {
-            if (header_name_eq(line.substr(0, 14), "Content-Length")) {
-                size_t j = 15;
-                while (j < line.size() && (line[j] == ' ' || line[j] == '\t')) ++j;
-                size_t start = j;
-                while (j < line.size() && line[j] >= '0' && line[j] <= '9') ++j;
-                if (j > start) {
-                    try {
-                        return std::stoull(std::string(line.substr(start, j - start)));
-                    } catch (...) {
-                        return 0;
-                    }
-                }
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string_view name = line.substr(0, colon);
+
+        // Match Content-Length and Transfer-Encoding case-insensitively.
+        if (header_name_eq(name, "Content-Length")) {
+            std::string_view value = line.substr(colon + 1);
+            // Trim OWS.
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                value.remove_prefix(1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                value.remove_suffix(1);
+            if (value.empty()) {
+                out.status = FramingHeaders::Status::InvalidContentLength;
+                return out;
+            }
+            // RFC 7230 §3.3.3 rule 4: a list of identical numeric values is
+            // permissible; conflicting values must be rejected.  We support a
+            // single numeric value here and reject comma lists outright as a
+            // smuggling hazard.
+            size_t j = 0;
+            while (j < value.size() && value[j] >= '0' && value[j] <= '9') ++j;
+            if (j == 0 || j != value.size()) {
+                out.status = FramingHeaders::Status::InvalidContentLength;
+                return out;
+            }
+            size_t parsed = 0;
+            try {
+                parsed = std::stoull(std::string(value));
+            } catch (...) {
+                out.status = FramingHeaders::Status::InvalidContentLength;
+                return out;
+            }
+            if (saw_cl && parsed != out.content_length) {
+                out.status = FramingHeaders::Status::ConflictingContentLength;
+                return out;
+            }
+            if (parsed > MAX_REQUEST_BODY) {
+                out.content_length = parsed;
+                out.status = FramingHeaders::Status::ContentLengthTooLarge;
+                return out;
+            }
+            saw_cl = true;
+            out.content_length = parsed;
+        } else if (header_name_eq(name, "Transfer-Encoding")) {
+            std::string_view value = line.substr(colon + 1);
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                value.remove_prefix(1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                value.remove_suffix(1);
+            // "identity" alone is harmless; anything else (including chunked,
+            // which we do not decode) is a smuggling hazard.
+            if (!value.empty() && !header_name_eq(value, "identity")) {
+                saw_te = true;
             }
         }
-        pos = line_end + 1;
     }
-    return 0;
+
+    if (saw_te) {
+        out.status = saw_cl ? FramingHeaders::Status::CLAndTEMixed
+                            : FramingHeaders::Status::TransferEncodingPresent;
+    }
+    return out;
 }
 
 // HTTP server supporting both TCP and Unix Domain Socket listeners.
 class HttpServer {
 public:
-    // Construct a TCP listener on the given port.
-    static HttpServer tcp(int port) {
+    // Construct a TCP listener bound to the given address and port.
+    // bind_addr should be a numeric IPv4 address (e.g. "127.0.0.1" for
+    // loopback only, "0.0.0.0" for all interfaces).
+    static HttpServer tcp(int port, const std::string &bind_addr) {
         HttpServer s;
         s.mode_ = Mode::TCP;
         s.port_ = port;
+        s.bind_addr_ = bind_addr;
         return s;
     }
 
     // Construct a Unix Domain Socket listener at the given path.
-    static HttpServer uds(const std::string &path, mode_t sock_perm = 0666) {
+    // sock_perm defaults to owner-only (DEFAULT_SOCK_PERM = 0600); use the
+    // --sock-perm flag to broaden access for cross-user deployments.
+    static HttpServer uds(const std::string &path,
+                          mode_t sock_perm = DEFAULT_SOCK_PERM) {
         HttpServer s;
         s.mode_ = Mode::UDS;
         s.uds_path_ = path;
@@ -306,15 +437,20 @@ public:
 
         enum class ConnState { ReadingHeaders, Active };
 
+        using SteadyClock = std::chrono::steady_clock;
+
         struct ConnCtx {
             ConnState state = ConnState::ReadingHeaders;
             std::string header_buf;                    // accumulates header bytes
             std::shared_ptr<ConnectionIO> conn_io;     // bridge to worker thread
             bool body_complete = false;                // all body bytes received
             uint32_t epoll_events = EPOLLIN;           // currently registered events
+            SteadyClock::time_point last_active{};      // for idle-timeout eviction
         };
 
         std::unordered_map<int, ConnCtx> connections;
+        const auto idle_timeout = std::chrono::seconds(LSPROXY_IDLE_TIMEOUT_SECS);
+        auto last_idle_sweep = SteadyClock::now();
 
         // Helper: update epoll registration for a client fd.
         auto update_epoll = [&](int fd, ConnCtx &ctx, uint32_t new_events) {
@@ -359,6 +495,32 @@ public:
                 break;
             }
 
+            // Periodic idle sweep: close connections whose last_active is
+            // older than the idle-timeout window.  Run at most once per
+            // second to keep the hot path cheap.
+            {
+                auto now = SteadyClock::now();
+                if (now - last_idle_sweep >= std::chrono::seconds(1)) {
+                    last_idle_sweep = now;
+                    std::vector<int> stale;
+                    for (auto &[cfd, cctx] : connections) {
+                        if (cctx.last_active.time_since_epoch().count() == 0) continue;
+                        if (now - cctx.last_active > idle_timeout) {
+                            stale.push_back(cfd);
+                        }
+                    }
+                    for (int cfd : stale) {
+                        auto cit = connections.find(cfd);
+                        if (cit == connections.end()) continue;
+                        LOG_INFO("[LSPROXY] Closing idle connection fd " << cfd
+                                 << " (no activity for "
+                                 << LSPROXY_IDLE_TIMEOUT_SECS << "s)");
+                        close_conn(cfd, cit->second);
+                        connections.erase(cit);
+                    }
+                }
+            }
+
             for (int i = 0; i < nfds; ++i) {
                 int fd = events[i].data.fd;
                 uint32_t ev = events[i].events;
@@ -379,6 +541,20 @@ public:
                         }
                         LOG_INFO("Accepted new connection: fd " << client_fd);
 
+                        // Enforce the concurrent-connection cap.  Returning
+                        // a 503 with Connection: close gives the client a
+                        // clear failure signal before tearing down.
+                        if (connections.size() >= MAX_LSPROXY_CONNECTIONS) {
+                            LOG_ERROR("Connection cap reached (" << MAX_LSPROXY_CONNECTIONS
+                                      << "); rejecting fd " << client_fd);
+                            const char *resp =
+                                "HTTP/1.1 503 Service Unavailable\r\n"
+                                "Connection: close\r\nContent-Length: 0\r\n\r\n";
+                            ::send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+                            close(client_fd);
+                            continue;
+                        }
+
                         set_nonblocking(client_fd);
 
                         struct epoll_event client_ev{};
@@ -391,7 +567,9 @@ public:
                             continue;
                         }
 
-                        connections[client_fd] = ConnCtx{};
+                        ConnCtx ctx_new;
+                        ctx_new.last_active = SteadyClock::now();
+                        connections[client_fd] = std::move(ctx_new);
                     }
                     continue;
                 }
@@ -436,6 +614,9 @@ public:
                 auto it = connections.find(fd);
                 if (it == connections.end()) continue;
                 ConnCtx &ctx = it->second;
+                // Any epoll event on this fd counts as activity for the
+                // idle-timeout sweep above.
+                ctx.last_active = SteadyClock::now();
 
                 if (ev & (EPOLLERR | EPOLLHUP)) {
                     close_conn(fd, ctx);
@@ -494,7 +675,39 @@ public:
                                 ctx.header_buf.clear();
                                 ctx.header_buf.shrink_to_fit();
 
-                                size_t content_length = extract_content_length(header_data);
+                                FramingHeaders framing = parse_framing_headers(header_data);
+                                if (framing.status != FramingHeaders::Status::Ok) {
+                                    const char *resp = nullptr;
+                                    const char *reason = "unknown";
+                                    switch (framing.status) {
+                                    case FramingHeaders::Status::ContentLengthTooLarge:
+                                        resp = "HTTP/1.1 413 Payload Too Large\r\n"
+                                               "Connection: close\r\nContent-Length: 0\r\n\r\n";
+                                        reason = "Content-Length exceeds limit";
+                                        break;
+                                    case FramingHeaders::Status::TransferEncodingPresent:
+                                    case FramingHeaders::Status::CLAndTEMixed:
+                                        resp = "HTTP/1.1 400 Bad Request\r\n"
+                                               "Connection: close\r\nContent-Length: 0\r\n\r\n";
+                                        reason = "Transfer-Encoding not supported";
+                                        break;
+                                    case FramingHeaders::Status::ConflictingContentLength:
+                                    case FramingHeaders::Status::InvalidContentLength:
+                                    default:
+                                        resp = "HTTP/1.1 400 Bad Request\r\n"
+                                               "Connection: close\r\nContent-Length: 0\r\n\r\n";
+                                        reason = "invalid Content-Length";
+                                        break;
+                                    }
+                                    LOG_ERROR("Rejecting request on fd " << fd
+                                              << ": " << reason);
+                                    ::send(fd, resp, strlen(resp), MSG_NOSIGNAL);
+                                    close_conn(fd, ctx);
+                                    connections.erase(it);
+                                    continue;
+                                }
+
+                                size_t content_length = framing.content_length;
 
                                 LOG_INFO("Received request: fd " << fd << ", content-length " << content_length);
 
@@ -604,7 +817,12 @@ public:
 private:
     enum class Mode { TCP, UDS };
 
-    HttpServer() : mode_(Mode::TCP), port_(DEFAULT_PORT), sock_perm_(0666), server_socket_(-1) {}
+    HttpServer()
+        : mode_(Mode::TCP),
+          port_(DEFAULT_PORT),
+          bind_addr_(DEFAULT_BIND_ADDR),
+          sock_perm_(DEFAULT_SOCK_PERM),
+          server_socket_(-1) {}
 
     // ── Helper: set a socket to non-blocking mode ───────────────────────
 
@@ -632,12 +850,18 @@ private:
 
         sockaddr_in server_addr{};
         server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        server_addr.sin_port = htons(port_);
+        server_addr.sin_port = htons(static_cast<uint16_t>(port_));
+        if (inet_pton(AF_INET, bind_addr_.c_str(), &server_addr.sin_addr) != 1) {
+            LOG_ERROR("Invalid --bind address (expected numeric IPv4): "
+                      << bind_addr_);
+            close(server_socket_);
+            return false;
+        }
 
         if (bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
                  sizeof(server_addr)) < 0) {
-            LOG_ERROR("Failed to bind TCP socket to port " << port_);
+            LOG_ERROR("Failed to bind TCP socket to " << bind_addr_ << ":"
+                      << port_ << ": " << strerror(errno));
             close(server_socket_);
             return false;
         }
@@ -649,7 +873,12 @@ private:
         }
 
         g_server_socket = server_socket_;
-        LOG_INFO("HTTP Server listening on TCP port " << port_);
+        LOG_INFO("HTTP Server listening on TCP " << bind_addr_ << ":" << port_);
+        if (bind_addr_ == "0.0.0.0") {
+            LOG_INFO("WARNING: --bind 0.0.0.0 exposes lswasm to all network "
+                     "interfaces with no authentication. Restrict access via "
+                     "firewall/ACL.");
+        }
         return true;
     }
 
@@ -663,6 +892,9 @@ private:
         }
 
         // Ensure the parent directory exists (e.g. /tmp/lshttpd/).
+        // Directory permissions follow the process umask; we deliberately do
+        // not lock the directory to 0700 so that operators can place the
+        // socket in shared directories when they need cross-user access.
         std::filesystem::path parent = std::filesystem::path(uds_path_).parent_path();
         if (!parent.empty()) {
             std::error_code ec;
@@ -675,12 +907,27 @@ private:
             }
         }
 
-        // Remove any pre-existing socket path before bind(). This lets
-        // standalone LSPROXY mode recover from stale UDS files left behind by
-        // an earlier crash or forced stop.
+        // Remove any pre-existing socket path before bind().  This recovers
+        // from a stale UDS file left behind by an earlier crash or forced
+        // stop.  Refuse to unlink symlinks: an attacker who can plant a
+        // symlink in a world-writable directory could otherwise redirect the
+        // unlink/chmod operations onto an unrelated file.
         {
-            std::error_code ec;
-            if (std::filesystem::exists(uds_path_, ec)) {
+            struct stat st{};
+            if (::lstat(uds_path_.c_str(), &st) == 0) {
+                if (S_ISLNK(st.st_mode)) {
+                    LOG_ERROR("Refusing to operate on UDS path that is a symlink: "
+                              << uds_path_
+                              << ". Remove it manually after verifying its target.");
+                    close(server_socket_);
+                    return false;
+                }
+                if (!S_ISSOCK(st.st_mode)) {
+                    LOG_ERROR("Refusing to unlink non-socket file at UDS path: "
+                              << uds_path_);
+                    close(server_socket_);
+                    return false;
+                }
                 if (::unlink(uds_path_.c_str()) != 0) {
                     LOG_ERROR("Failed to remove existing Unix domain socket path "
                               << uds_path_ << ": " << strerror(errno));
@@ -688,9 +935,9 @@ private:
                     return false;
                 }
                 LOG_INFO("Removed existing Unix domain socket path " << uds_path_);
-            } else if (ec) {
+            } else if (errno != ENOENT) {
                 LOG_ERROR("Failed to inspect Unix domain socket path "
-                          << uds_path_ << ": " << ec.message());
+                          << uds_path_ << ": " << strerror(errno));
                 close(server_socket_);
                 return false;
             }
@@ -709,28 +956,58 @@ private:
         std::strncpy(server_addr.sun_path, uds_path_.c_str(),
                       sizeof(server_addr.sun_path) - 1);
 
-        if (bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
-                 sizeof(server_addr)) < 0) {
-            if (errno == EADDRINUSE && ::unlink(uds_path_.c_str()) == 0 &&
-                bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
-                     sizeof(server_addr)) == 0) {
-                LOG_INFO("Removed stale Unix domain socket path and retried bind: "
-                         << uds_path_);
-            } else {
-                LOG_ERROR("Failed to bind Unix domain socket at " << uds_path_
-                          << ": " << strerror(errno));
-                close(server_socket_);
-                return false;
-            }
+        // Constrain the umask so bind() creates the socket file with the
+        // requested mode and no broader.  umask is per-process so other
+        // threads briefly observe the tightened mask; bind() is the only
+        // file-creation call in this critical section.
+        const mode_t mask = static_cast<mode_t>(0777) & ~sock_perm_;
+        mode_t prev_umask = ::umask(mask);
+
+        int bind_rc = bind(server_socket_, reinterpret_cast<sockaddr *>(&server_addr),
+                           sizeof(server_addr));
+        int bind_errno = errno;
+        ::umask(prev_umask);
+
+        if (bind_rc < 0) {
+            LOG_ERROR("Failed to bind Unix domain socket at " << uds_path_
+                      << ": " << strerror(bind_errno));
+            close(server_socket_);
+            return false;
         }
 
-        // Set socket file permissions (configurable via --sock-perm, default 0666).
-        if (chmod(uds_path_.c_str(), sock_perm_) != 0) {
-            LOG_ERROR("Failed to set permissions on Unix domain socket: "
-                      << strerror(errno));
-            close(server_socket_);
-            cleanup_uds();
-            return false;
+        // Verify what was actually created.  If it is not a regular socket
+        // owned by us, do not proceed (refuses to chmod something that an
+        // attacker replaced via a path race).
+        {
+            struct stat st{};
+            if (::lstat(uds_path_.c_str(), &st) != 0) {
+                LOG_ERROR("Failed to stat newly bound UDS path " << uds_path_
+                          << ": " << strerror(errno));
+                close(server_socket_);
+                cleanup_uds();
+                return false;
+            }
+            if (!S_ISSOCK(st.st_mode) || st.st_uid != ::geteuid()) {
+                LOG_ERROR("UDS path " << uds_path_
+                          << " is not a socket owned by this process; refusing to chmod.");
+                close(server_socket_);
+                cleanup_uds();
+                return false;
+            }
+            // chmod is only needed if umask alone could not produce the
+            // requested permissions (e.g. setgid bits, or to widen permissions
+            // beyond what umask would allow).  Skip it when the bind-time
+            // mode already matches.
+            const mode_t actual = st.st_mode & 0777;
+            if (actual != sock_perm_) {
+                if (::chmod(uds_path_.c_str(), sock_perm_) != 0) {
+                    LOG_ERROR("Failed to set permissions on Unix domain socket: "
+                              << strerror(errno));
+                    close(server_socket_);
+                    cleanup_uds();
+                    return false;
+                }
+            }
         }
 
         if (listen(server_socket_, BACKLOG) < 0) {
@@ -742,7 +1019,15 @@ private:
 
         g_server_socket = server_socket_;
         g_uds_path = uds_path_;
-        LOG_INFO("HTTP Server listening on Unix socket " << uds_path_);
+        LOG_INFO("HTTP Server listening on Unix socket " << uds_path_
+                 << " (mode 0" << std::oct << static_cast<unsigned>(sock_perm_)
+                 << std::dec << ")");
+        if ((sock_perm_ & 0006) != 0) {
+            LOG_INFO("WARNING: UDS is world-accessible (mode 0"
+                     << std::oct << static_cast<unsigned>(sock_perm_) << std::dec
+                     << "). Any local user can connect; restrict via "
+                     "--sock-perm or directory ACLs.");
+        }
         return true;
     }
 
@@ -953,37 +1238,93 @@ private:
         conn->finish();
     }
 
+    // Parse a raw HTTP/1.x request header block.  Returns false on any
+    // malformed input: embedded NUL, obs-fold continuation lines, whitespace
+    // between field name and colon, non-token header-name characters, or
+    // CRLF inside a header value.  These each provide smuggling or
+    // request-splitting pivots and must be rejected outright.
     bool parse_request(const std::string &request, HttpData &http_data) {
-        std::istringstream iss(request);
-        iss >> http_data.method >> http_data.path >> http_data.version;
-
-        if (http_data.method.empty() || http_data.path.empty()) {
+        if (request.find('\0') != std::string::npos) {
+            LOG_ERROR("Request contains embedded NUL");
             return false;
         }
 
-        // Parse headers (simplified).
-        std::string line;
-        // Consume the remainder of the request line.
-        std::getline(iss, line);
-        while (std::getline(iss, line) && !line.empty() && line != "\r") {
-            size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                std::string header_name = line.substr(0, colon);
-                std::string header_value = line.substr(colon + 1);
-                // Trim leading whitespace (OWS per RFC 7230)
-                size_t start = header_value.find_first_not_of(" \t");
-                if (start != std::string::npos) {
-                    header_value = header_value.substr(start);
-                } else {
-                    header_value.clear();
-                }
-                // Remove trailing \r if present
-                if (!header_value.empty() && header_value.back() == '\r') {
-                    header_value.pop_back();
-                }
-                http_data.request_headers.emplace_back(std::move(header_name),
-                                                       std::move(header_value));
+        size_t pos = 0;
+
+        // ── Request line ─────────────────────────────────────────────────
+        size_t line_end = request.find('\n', pos);
+        if (line_end == std::string::npos) return false;
+        std::string_view request_line(request.data() + pos,
+                                       line_end - pos);
+        if (!request_line.empty() && request_line.back() == '\r')
+            request_line.remove_suffix(1);
+        pos = line_end + 1;
+
+        // method SP path SP version
+        size_t sp1 = request_line.find(' ');
+        if (sp1 == std::string_view::npos) return false;
+        size_t sp2 = request_line.find(' ', sp1 + 1);
+        if (sp2 == std::string_view::npos) return false;
+        std::string_view method = request_line.substr(0, sp1);
+        std::string_view path = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
+        std::string_view version = request_line.substr(sp2 + 1);
+
+        if (method.empty() || path.empty() || version.empty()) return false;
+        // method must be tokens; path and version forbid CTL chars.
+        for (unsigned char c : method) {
+            if (!is_tchar(c)) return false;
+        }
+        for (unsigned char c : path) {
+            if (c < 0x20 || c == 0x7f) return false;
+        }
+        for (unsigned char c : version) {
+            if (c < 0x20 || c == 0x7f) return false;
+        }
+        http_data.method.assign(method);
+        http_data.path.assign(path);
+        http_data.version.assign(version);
+
+        // ── Header lines ─────────────────────────────────────────────────
+        while (pos < request.size()) {
+            line_end = request.find('\n', pos);
+            if (line_end == std::string::npos) line_end = request.size();
+            std::string_view line(request.data() + pos, line_end - pos);
+            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+            pos = line_end + 1;
+            if (line.empty()) break;  // end of header block
+
+            // Reject obs-fold (RFC 7230 §3.2.4): no line may start with WS.
+            if (line.front() == ' ' || line.front() == '\t') {
+                LOG_ERROR("Rejecting obs-fold header continuation");
+                return false;
             }
+
+            size_t colon = line.find(':');
+            if (colon == std::string_view::npos) {
+                LOG_ERROR("Header line missing colon");
+                return false;
+            }
+            std::string_view name = line.substr(0, colon);
+            // RFC 7230 §3.2.4: no whitespace between field name and colon.
+            if (!is_valid_header_name(name)) {
+                LOG_ERROR("Invalid header name");
+                return false;
+            }
+
+            std::string_view value = line.substr(colon + 1);
+            // Trim leading OWS.
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                value.remove_prefix(1);
+            // Trim trailing OWS.
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                value.remove_suffix(1);
+            if (!is_valid_header_value(value)) {
+                LOG_ERROR("Invalid character in header value");
+                return false;
+            }
+
+            http_data.request_headers.emplace_back(std::string(name),
+                                                    std::string(value));
         }
 
         return true;
@@ -1075,6 +1416,7 @@ private:
 
     Mode mode_;
     int port_;
+    std::string bind_addr_;
     std::string uds_path_;
     mode_t sock_perm_;
     int server_socket_;
@@ -1177,6 +1519,21 @@ bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm) {
         return true;
     }
 
+    // Verify the path is a socket owned by us before chmod-ing it.  This
+    // guards against a symlink swap between LSAPI_CreateListenSock() and
+    // here in a world-writable directory.
+    struct stat st{};
+    if (::lstat(addr.sun_path, &st) != 0) {
+        LOG_ERROR("[LSAPI] lstat() failed on listener socket path "
+                  << addr.sun_path << ": " << strerror(errno));
+        return false;
+    }
+    if (!S_ISSOCK(st.st_mode) || st.st_uid != ::geteuid()) {
+        LOG_ERROR("[LSAPI] Listener socket path " << addr.sun_path
+                  << " is not a socket owned by this process; refusing to chmod.");
+        return false;
+    }
+
     if (chmod(addr.sun_path, sock_perm) != 0) {
         LOG_ERROR("[LSAPI] Failed to set permissions on LSAPI Unix socket "
                   << addr.sun_path << ": " << strerror(errno));
@@ -1185,6 +1542,12 @@ bool ensure_lsapi_listener_socket_permissions(int listen_fd, mode_t sock_perm) {
 
     LOG_INFO("[LSAPI] Set permissions on LSAPI Unix socket " << addr.sun_path
              << " to " << std::oct << static_cast<unsigned>(sock_perm) << std::dec);
+    if ((sock_perm & 0006) != 0) {
+        LOG_INFO("[LSAPI] WARNING: listener socket is world-accessible (mode 0"
+                 << std::oct << static_cast<unsigned>(sock_perm) << std::dec
+                 << "). Any local user can speak LSAPI to lswasm; restrict via "
+                 "--sock-perm or directory ACLs.");
+    }
     return true;
 }
 
@@ -1330,10 +1693,23 @@ private:
 };
 
 // LSAPI_ForeachHeader_r callback: accumulate headers into HeaderPairs.
+//
+// Header names and values arrive from the LSAPI library which does only
+// limited validation.  Drop any pair whose name is not a valid RFC 7230
+// token or whose value contains CR/LF/NUL — forwarding such pairs into the
+// WASM filter (and possibly back out via setHeaderMapPairs) would create a
+// response-splitting pivot.
 int lsapi_header_cb(const char *key, int keyLen,
                     const char *value, int valLen, void *arg) {
-    LOG_INFO("lsapi_header: " << std::string(key, static_cast<size_t>(keyLen)) << " = "
-             << std::string(value, static_cast<size_t>(valLen)));
+    if (keyLen <= 0 || valLen < 0) {
+        return 1;  // skip but continue
+    }
+    std::string_view raw_value(value, static_cast<size_t>(valLen));
+    if (!http_utils::is_valid_header_value_chars(raw_value)) {
+        LOG_ERROR("[LSAPI] dropping header with CR/LF/NUL in value");
+        return 1;
+    }
+
     auto *hdrs = static_cast<HeaderPairs *>(arg);
     // LSAPI delivers CGI-style header names (HTTP_ACCEPT, HTTP_HOST, …).
     // Convert them to standard HTTP header names:
@@ -1359,7 +1735,12 @@ int lsapi_header_cb(const char *key, int keyLen,
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
     }
-    hdrs->emplace_back(std::move(name), std::string(value, static_cast<size_t>(valLen)));
+    if (!http_utils::is_valid_header_name_chars(name)) {
+        LOG_ERROR("[LSAPI] dropping header with invalid name characters");
+        return 1;
+    }
+    LOG_INFO("lsapi_header: " << name << " = " << raw_value);
+    hdrs->emplace_back(std::move(name), std::string(raw_value));
     return 1;  // continue iteration
 }
 
@@ -1577,7 +1958,8 @@ void lsapi_handle_request(LSAPI_Request *req) {
 int run_lsapi_loop(const std::string &wasm_module_path,
                    const std::unordered_map<std::string, std::string> &wasm_envs,
                    size_t num_workers,
-                   const std::string &bind_addr) {
+                   const std::string &bind_addr,
+                   mode_t sock_perm) {
     // If a bind address was provided, create a listener socket and dup2 it
     // onto fd 0 so that LSAPI_Init() picks it up as the listening socket.
     if (!bind_addr.empty()) {
@@ -1611,16 +1993,18 @@ int run_lsapi_loop(const std::string &wasm_module_path,
         LOG_ERROR("[LSAPI] No listener or connected fd available after LSAPI_Init()");
         return 1;
     }
-    if (listen_fd >= 0 && !ensure_lsapi_listener_socket_permissions(listen_fd)) {
+    if (listen_fd >= 0 && !ensure_lsapi_listener_socket_permissions(listen_fd, sock_perm)) {
         return 1;
     }
     g_server_socket = (listen_fd >= 0) ? listen_fd : connected_fd;
 
     g_module_manager = std::make_unique<WasmModuleManager>();
     if (!wasm_envs.empty()) {
-        LOG_INFO("[LSAPI] WASM environment variables:");
+        // Log only the keys; values may contain secrets.
+        LOG_INFO("[LSAPI] WASM environment variables (" << wasm_envs.size() << "):");
         for (const auto &[key, value] : wasm_envs) {
-            LOG_INFO("[LSAPI]   " << key << "=" << value);
+            (void)value;
+            LOG_INFO("[LSAPI]   " << key << "=<redacted>");
         }
         g_module_manager->setEnvironmentVariables(wasm_envs);
     }
@@ -1794,30 +2178,66 @@ int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
     std::string wasm_module_path;
     std::string uds_path = DEFAULT_UDS_PATH;
-    mode_t sock_perm = 0666;
+    std::string bind_addr = DEFAULT_BIND_ADDR;
+    mode_t sock_perm = DEFAULT_SOCK_PERM;
     std::unordered_map<std::string, std::string> wasm_envs;
     bool debug = false;
     bool port_specified = false;
     bool uds_specified = false;
+    bool bind_specified = false;
     bool sock_perm_specified = false;
     bool lsapi_mode = true;
     std::string lsapi_bind_addr;  // Optional LSAPI listening socket address (e.g. "127.0.0.1:8000")
     size_t num_workers = 0;  // 0 = auto (hardware_concurrency)
+    constexpr size_t WORKER_HARD_CAP = MAX_WORKER_THREADS;
+
+    // Helper: parse a non-negative integer CLI argument with bounds.
+    auto parse_uint_arg = [](const char *flag, const char *raw,
+                              unsigned long lo, unsigned long hi,
+                              unsigned long &out) -> bool {
+        if (!raw || *raw == '\0') {
+            std::cerr << "Error: " << flag << " requires a value.\n";
+            return false;
+        }
+        char *endptr = nullptr;
+        errno = 0;
+        unsigned long parsed = std::strtoul(raw, &endptr, 10);
+        if (errno != 0 || endptr == raw || *endptr != '\0') {
+            std::cerr << "Error: " << flag << " requires a non-negative integer (got '"
+                      << raw << "').\n";
+            return false;
+        }
+        if (parsed < lo || parsed > hi) {
+            std::cerr << "Error: " << flag << " out of range [" << lo << ", "
+                      << hi << "] (got " << parsed << ").\n";
+            return false;
+        }
+        out = parsed;
+        return true;
+    };
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
-            port = std::stoi(argv[++i]);
+            unsigned long parsed = 0;
+            if (!parse_uint_arg("--port", argv[++i], 1, 65535, parsed)) {
+                return 1;
+            }
+            port = static_cast<int>(parsed);
             port_specified = true;
+        } else if (arg == "--bind" && i + 1 < argc) {
+            bind_addr = argv[++i];
+            bind_specified = true;
         } else if (arg == "--uds" && i + 1 < argc) {
             uds_path = argv[++i];
             uds_specified = true;
         } else if (arg == "--sock-perm" && i + 1 < argc) {
             const char *val = argv[++i];
             char *endptr = nullptr;
+            errno = 0;
             unsigned long parsed = std::strtoul(val, &endptr, 8);
-            if (endptr == val || *endptr != '\0' || parsed > 0777) {
+            if (errno != 0 || endptr == val || *endptr != '\0' || parsed > 0777) {
                 LOG_ERROR("Invalid --sock-perm value (expected octal 0-0777): " << val);
                 return 1;
             }
@@ -1837,7 +2257,11 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         } else if (arg == "--workers" && i + 1 < argc) {
-            num_workers = static_cast<size_t>(std::stoi(argv[++i]));
+            unsigned long parsed = 0;
+            if (!parse_uint_arg("--workers", argv[++i], 1, WORKER_HARD_CAP, parsed)) {
+                return 1;
+            }
+            num_workers = static_cast<size_t>(parsed);
         } else if (arg == "--lsapi-addr" && i + 1 < argc) {
             lsapi_bind_addr = argv[++i];
         } else if (arg == "--lsproxy") {
@@ -1855,12 +2279,19 @@ int main(int argc, char *argv[]) {
             std::cout << "Usage: " << argv[0] << " --module <path> [options]\n";
             std::cout << "Options:\n";
             std::cout << "  --port PORT      : Listen on TCP port in LSPROXY mode (instead of UDS)\n";
+            std::cout << "  --bind ADDR      : TCP bind address for LSPROXY mode (default: "
+                      << DEFAULT_BIND_ADDR << "; use 0.0.0.0 for all interfaces)\n";
             std::cout << "  --uds PATH       : Unix domain socket path for LSPROXY mode (default: "
                       << DEFAULT_UDS_PATH << ")\n";
-            std::cout << "  --sock-perm MODE : Set LSPROXY UDS file permissions in octal (default: 0666)\n";
+            std::cout << "  --sock-perm MODE : Set listener UDS file permissions in octal (default: 0"
+                      << std::oct << static_cast<unsigned>(DEFAULT_SOCK_PERM) << std::dec
+                      << ", owner-only).\n"
+                      << "                     Broaden (e.g. 0660 with group setup, or 0666) when the\n"
+                      << "                     web server or other clients run as a different user.\n";
             std::cout << "  --module PATH    : Load WASM filter module (required)\n";
             std::cout << "  --env KEY=VALUE  : Set environment variable for WASM module (repeatable)\n";
-            std::cout << "  --workers N      : Number of worker threads (default: hardware_concurrency)\n";
+            std::cout << "  --workers N      : Number of worker threads (default: hardware_concurrency, max "
+                      << WORKER_HARD_CAP << ")\n";
             std::cout << "  --lsapi-addr ADDR: Bind LSAPI to address (e.g. 127.0.0.1:8000 or /tmp/lswasm.sock)\n";
             std::cout << "  --lsproxy        : Switch from default LSAPI mode to standalone LSPROXY mode\n";
             std::cout << "  --body-pacifier  : Include diagnostic body in generated responses\n";
@@ -1871,13 +2302,21 @@ int main(int argc, char *argv[]) {
             std::cout << "\nBy default, lswasm runs in LSAPI mode.\n";
             std::cout << "Use --lsproxy for standalone UDS/TCP LSPROXY mode. "
                       << "When both --port and --uds are given, only --uds is used.\n";
+            std::cout << "\nSecurity defaults: TCP listener binds to "
+                      << DEFAULT_BIND_ADDR << " and UDS sockets are created mode 0"
+                      << std::oct << static_cast<unsigned>(DEFAULT_SOCK_PERM) << std::dec
+                      << " (owner-only).\n"
+                      << "Override --bind / --sock-perm when other users or hosts need access; "
+                      << "lswasm has no built-in authentication.\n";
             return 0;
         }
     }
 
     // Validate LSAPI-vs-LSPROXY option usage.
-    if (lsapi_mode && (port_specified || sock_perm_specified || uds_specified)) {
-        std::cerr << "Error: --port, --sock-perm, and --uds require --lsproxy.\n";
+    // --sock-perm is accepted in either mode: LSAPI listeners created via
+    // --lsapi-addr also need permission control.
+    if (lsapi_mode && (port_specified || bind_specified || uds_specified)) {
+        std::cerr << "Error: --port, --bind, and --uds require --lsproxy.\n";
         return 1;
     }
     if (!lsapi_mode && !lsapi_bind_addr.empty()) {
@@ -1937,7 +2376,8 @@ int main(int argc, char *argv[]) {
         // Listener-based LSAPI setups use threaded dispatch; direct-channel
         // LSAPI setups fall back to serial request processing.
         LOG_INFO("Starting LSAPI transport mode...");
-        return run_lsapi_loop(wasm_module_path, wasm_envs, num_workers, lsapi_bind_addr);
+        return run_lsapi_loop(wasm_module_path, wasm_envs, num_workers,
+                              lsapi_bind_addr, sock_perm);
     }
 
     // ── LSPROXY transport mode (--lsproxy) ────────────────────────────────
@@ -1945,9 +2385,14 @@ int main(int argc, char *argv[]) {
     g_module_manager = std::make_unique<WasmModuleManager>();
 
     if (!wasm_envs.empty()) {
-        LOG_INFO("WASM environment variables:");
+        // Log only the keys.  Values are operator-supplied configuration that
+        // commonly contains secrets (API keys, tokens); never write them to
+        // the log file or stderr.
+        LOG_INFO("WASM environment variables (" << wasm_envs.size()
+                 << "):");
         for (const auto &[key, value] : wasm_envs) {
-            LOG_INFO("  " << key << "=" << value);
+            (void)value;
+            LOG_INFO("  " << key << "=<redacted>");
         }
         g_module_manager->setEnvironmentVariables(wasm_envs);
     }
@@ -1976,7 +2421,7 @@ int main(int argc, char *argv[]) {
         if (explicit_uds || !port_specified) {
             server = std::make_unique<HttpServer>(HttpServer::uds(uds_path, sock_perm));
         } else {
-            server = std::make_unique<HttpServer>(HttpServer::tcp(port));
+            server = std::make_unique<HttpServer>(HttpServer::tcp(port, bind_addr));
         }
 
         if (!server->start()) {
